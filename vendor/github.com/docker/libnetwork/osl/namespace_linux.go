@@ -14,10 +14,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/pkg/reexec"
 	"github.com/docker/libnetwork/ns"
 	"github.com/docker/libnetwork/types"
+	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 )
@@ -48,7 +48,7 @@ type networkNamespace struct {
 	gwv6         net.IP
 	staticRoutes []*types.StaticRoute
 	neighbors    []*neigh
-	nextIfIndex  int
+	nextIfIndex  map[string]int
 	isDefault    bool
 	nlHandle     *netlink.Handle
 	loV6Enabled  bool
@@ -203,7 +203,7 @@ func NewSandbox(key string, osCreate, isRestore bool) (Sandbox, error) {
 		once.Do(createBasePath)
 	}
 
-	n := &networkNamespace{path: key, isDefault: !osCreate}
+	n := &networkNamespace{path: key, isDefault: !osCreate, nextIfIndex: make(map[string]int)}
 
 	sboxNs, err := netns.GetFromPath(n.path)
 	if err != nil {
@@ -220,11 +220,15 @@ func NewSandbox(key string, osCreate, isRestore bool) (Sandbox, error) {
 	if err != nil {
 		logrus.Warnf("Failed to set the timeout on the sandbox netlink handle sockets: %v", err)
 	}
-
+	// In live-restore mode, IPV6 entries are getting cleaned up due to below code
+	// We should retain IPV6 configrations in live-restore mode when Docker Daemon
+	// comes back. It should work as it is on other cases
 	// As starting point, disable IPv6 on all interfaces
-	err = setIPv6(n.path, "all", false)
-	if err != nil {
-		logrus.Warnf("Failed to disable IPv6 on all interfaces on network namespace %q: %v", n.path, err)
+	if !isRestore && !n.isDefault {
+		err = setIPv6(n.path, "all", false)
+		if err != nil {
+			logrus.Warnf("Failed to disable IPv6 on all interfaces on network namespace %q: %v", n.path, err)
+		}
 	}
 
 	if err = n.loopbackUp(); err != nil {
@@ -256,7 +260,7 @@ func GetSandboxForExternalKey(basePath string, key string) (Sandbox, error) {
 	if err := mountNetworkNamespace(basePath, key); err != nil {
 		return nil, err
 	}
-	n := &networkNamespace{path: key}
+	n := &networkNamespace{path: key, nextIfIndex: make(map[string]int)}
 
 	sboxNs, err := netns.GetFromPath(n.path)
 	if err != nil {
@@ -352,6 +356,22 @@ func (n *networkNamespace) loopbackUp() error {
 		return err
 	}
 	return n.nlHandle.LinkSetUp(iface)
+}
+
+func (n *networkNamespace) AddLoopbackAliasIP(ip *net.IPNet) error {
+	iface, err := n.nlHandle.LinkByName("lo")
+	if err != nil {
+		return err
+	}
+	return n.nlHandle.AddrAdd(iface, &netlink.Addr{IPNet: ip})
+}
+
+func (n *networkNamespace) RemoveLoopbackAliasIP(ip *net.IPNet) error {
+	iface, err := n.nlHandle.LinkByName("lo")
+	if err != nil {
+		return err
+	}
+	return n.nlHandle.AddrDel(iface, &netlink.Addr{IPNet: ip})
 }
 
 func (n *networkNamespace) InvokeFunc(f func()) error {
@@ -495,8 +515,8 @@ func (n *networkNamespace) Restore(ifsopt map[string][]IfaceOption, routes []*ty
 			}
 			index++
 			n.Lock()
-			if index > n.nextIfIndex {
-				n.nextIfIndex = index
+			if index > n.nextIfIndex[dstPrefix] {
+				n.nextIfIndex[dstPrefix] = index
 			}
 			n.iFaces = append(n.iFaces, i)
 			n.Unlock()

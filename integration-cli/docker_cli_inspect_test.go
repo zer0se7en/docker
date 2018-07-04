@@ -11,8 +11,8 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/integration-cli/checker"
-	icmd "github.com/docker/docker/pkg/testutil/cmd"
 	"github.com/go-check/check"
+	"gotest.tools/icmd"
 )
 
 func checkValidGraphDriver(c *check.C, name string) {
@@ -53,10 +53,7 @@ func (s *DockerSuite) TestInspectDefault(c *check.C) {
 }
 
 func (s *DockerSuite) TestInspectStatus(c *check.C) {
-	if testEnv.DaemonPlatform() != "windows" {
-		defer unpauseAllContainers(c)
-	}
-	out, _ := runSleepingContainer(c, "-d")
+	out := runSleepingContainer(c, "-d")
 	out = strings.TrimSpace(out)
 
 	inspectOut := inspectField(c, out, "State.Status")
@@ -64,7 +61,7 @@ func (s *DockerSuite) TestInspectStatus(c *check.C) {
 
 	// Windows does not support pause/unpause on Windows Server Containers.
 	// (RS1 does for Hyper-V Containers, but production CI is not setup for that)
-	if testEnv.DaemonPlatform() != "windows" {
+	if testEnv.OSType != "windows" {
 		dockerCmd(c, "pause", out)
 		inspectOut = inspectField(c, out, "State.Status")
 		c.Assert(inspectOut, checker.Equals, "paused")
@@ -209,7 +206,7 @@ func (s *DockerSuite) TestInspectContainerGraphDriver(c *check.C) {
 func (s *DockerSuite) TestInspectBindMountPoint(c *check.C) {
 	modifier := ",z"
 	prefix, slash := getPrefixAndSlashFromDaemonPlatform()
-	if testEnv.DaemonPlatform() == "windows" {
+	if testEnv.OSType == "windows" {
 		modifier = ""
 		// Linux creates the host directory if it doesn't exist. Windows does not.
 		os.Mkdir(`c:\data`, os.ModeDir)
@@ -232,7 +229,7 @@ func (s *DockerSuite) TestInspectBindMountPoint(c *check.C) {
 	c.Assert(m.Driver, checker.Equals, "")
 	c.Assert(m.Source, checker.Equals, prefix+slash+"data")
 	c.Assert(m.Destination, checker.Equals, prefix+slash+"data")
-	if testEnv.DaemonPlatform() != "windows" { // Windows does not set mode
+	if testEnv.OSType != "windows" { // Windows does not set mode
 		c.Assert(m.Mode, checker.Equals, "ro"+modifier)
 	}
 	c.Assert(m.RW, checker.Equals, false)
@@ -353,14 +350,22 @@ func (s *DockerSuite) TestInspectByPrefix(c *check.C) {
 }
 
 func (s *DockerSuite) TestInspectStopWhenNotFound(c *check.C) {
-	runSleepingContainer(c, "--name=busybox", "-d")
-	runSleepingContainer(c, "--name=not-shown", "-d")
-	out, _, err := dockerCmdWithError("inspect", "--type=container", "--format='{{.Name}}'", "busybox", "missing", "not-shown")
+	runSleepingContainer(c, "--name=busybox1", "-d")
+	runSleepingContainer(c, "--name=busybox2", "-d")
+	result := dockerCmdWithResult("inspect", "--type=container", "--format='{{.Name}}'", "busybox1", "busybox2", "missing")
 
-	c.Assert(err, checker.Not(check.IsNil))
-	c.Assert(out, checker.Contains, "busybox")
-	c.Assert(out, checker.Not(checker.Contains), "not-shown")
-	c.Assert(out, checker.Contains, "Error: No such container: missing")
+	c.Assert(result.Error, checker.Not(check.IsNil))
+	c.Assert(result.Stdout(), checker.Contains, "busybox1")
+	c.Assert(result.Stdout(), checker.Contains, "busybox2")
+	c.Assert(result.Stderr(), checker.Contains, "Error: No such container: missing")
+
+	// test inspect would not fast fail
+	result = dockerCmdWithResult("inspect", "--type=container", "--format='{{.Name}}'", "missing", "busybox1", "busybox2")
+
+	c.Assert(result.Error, checker.Not(check.IsNil))
+	c.Assert(result.Stdout(), checker.Contains, "busybox1")
+	c.Assert(result.Stdout(), checker.Contains, "busybox2")
+	c.Assert(result.Stderr(), checker.Contains, "Error: No such container: missing")
 }
 
 func (s *DockerSuite) TestInspectHistory(c *check.C) {
@@ -452,12 +457,4 @@ func (s *DockerSuite) TestInspectUnknownObject(c *check.C) {
 	c.Assert(err, checker.NotNil)
 	c.Assert(out, checker.Contains, "Error: No such object: foobar")
 	c.Assert(err.Error(), checker.Contains, "Error: No such object: foobar")
-}
-
-func (s *DockerSuite) TestInspectInvalidReference(c *check.C) {
-	// This test should work on both Windows and Linux
-	out, _, err := dockerCmdWithError("inspect", "FooBar")
-	c.Assert(err, checker.NotNil)
-	c.Assert(out, checker.Contains, "Error: No such object: FooBar")
-	c.Assert(err.Error(), checker.Contains, "Error: No such object: FooBar")
 }

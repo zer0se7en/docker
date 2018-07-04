@@ -1,7 +1,7 @@
 package encryption
 
 import (
-	"crypto/rand"
+	cryptorand "crypto/rand"
 	"fmt"
 	"io"
 
@@ -37,7 +37,7 @@ func (n NACLSecretbox) Algorithm() api.MaybeEncryptedRecord_Algorithm {
 // Encrypt encrypts some bytes and returns an encrypted record
 func (n NACLSecretbox) Encrypt(data []byte) (*api.MaybeEncryptedRecord, error) {
 	var nonce [24]byte
-	if _, err := io.ReadFull(rand.Reader, nonce[:]); err != nil {
+	if _, err := io.ReadFull(cryptorand.Reader, nonce[:]); err != nil {
 		return nil, err
 	}
 
@@ -67,7 +67,7 @@ func (n NACLSecretbox) Decrypt(record api.MaybeEncryptedRecord) ([]byte, error) 
 	// appended to.  Since we don't want to append anything, we pass nil.
 	decrypted, ok := secretbox.Open(nil, record.Data, &decryptNonce, &n.key)
 	if !ok {
-		return nil, fmt.Errorf("decryption error using NACL secretbox")
+		return nil, fmt.Errorf("no decryption key for record encrypted with %s", n.Algorithm())
 	}
 	return decrypted, nil
 }

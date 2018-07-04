@@ -4,7 +4,6 @@ import (
 	"container/heap"
 	"errors"
 	"strings"
-	"time"
 
 	"github.com/docker/swarmkit/api"
 	"github.com/docker/swarmkit/manager/constraint"
@@ -32,16 +31,6 @@ func (ns *nodeSet) nodeInfo(nodeID string) (NodeInfo, error) {
 // addOrUpdateNode sets the number of tasks for a given node. It adds the node
 // to the set if it wasn't already tracked.
 func (ns *nodeSet) addOrUpdateNode(n NodeInfo) {
-	if n.Tasks == nil {
-		n.Tasks = make(map[string]*api.Task)
-	}
-	if n.DesiredRunningTasksCountByService == nil {
-		n.DesiredRunningTasksCountByService = make(map[string]int)
-	}
-	if n.recentFailures == nil {
-		n.recentFailures = make(map[string][]time.Time)
-	}
-
 	ns.nodes[n.ID] = n
 }
 
@@ -96,8 +85,8 @@ func (ns *nodeSet) tree(serviceID string, preferences []*api.PlacementPreference
 			// sure that the tree structure is not affected by
 			// which properties nodes have and don't have.
 
-			if node.DesiredRunningTasksCountByService != nil {
-				tree.tasks += node.DesiredRunningTasksCountByService[serviceID]
+			if node.ActiveTasksCountByService != nil {
+				tree.tasks += node.ActiveTasksCountByService[serviceID]
 			}
 
 			if tree.next == nil {
@@ -109,6 +98,10 @@ func (ns *nodeSet) tree(serviceID string, preferences []*api.PlacementPreference
 				tree.next[value] = next
 			}
 			tree = next
+		}
+
+		if node.ActiveTasksCountByService != nil {
+			tree.tasks += node.ActiveTasksCountByService[serviceID]
 		}
 
 		if tree.nodeHeap.lessFunc == nil {

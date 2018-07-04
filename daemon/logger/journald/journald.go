@@ -2,28 +2,29 @@
 
 // Package journald provides the log driver for forwarding server logs
 // to endpoints that receive the systemd format.
-package journald
+package journald // import "github.com/docker/docker/daemon/logger/journald"
 
 import (
 	"fmt"
 	"sync"
 	"unicode"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/coreos/go-systemd/journal"
 	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/docker/daemon/logger/loggerutils"
+	"github.com/sirupsen/logrus"
 )
 
 const name = "journald"
 
 type journald struct {
+	mu      sync.Mutex
 	vars    map[string]string // additional variables and values to send to the journal along with the log message
 	readers readerList
+	closed  bool
 }
 
 type readerList struct {
-	mu      sync.Mutex
 	readers map[*logger.LogWatcher]*logger.LogWatcher
 }
 
@@ -74,8 +75,12 @@ func New(info logger.Info) (logger.Logger, error) {
 		"CONTAINER_ID_FULL": info.ContainerID,
 		"CONTAINER_NAME":    info.Name(),
 		"CONTAINER_TAG":     tag,
+		"SYSLOG_IDENTIFIER": tag,
 	}
-	extraAttrs := info.ExtraAttributes(sanitizeKeyMod)
+	extraAttrs, err := info.ExtraAttributes(sanitizeKeyMod)
+	if err != nil {
+		return nil, err
+	}
 	for k, v := range extraAttrs {
 		vars[k] = v
 	}
@@ -89,6 +94,7 @@ func validateLogOpt(cfg map[string]string) error {
 		switch key {
 		case "labels":
 		case "env":
+		case "env-regex":
 		case "tag":
 		default:
 			return fmt.Errorf("unknown log opt '%s' for journald log driver", key)
@@ -102,14 +108,15 @@ func (s *journald) Log(msg *logger.Message) error {
 	for k, v := range s.vars {
 		vars[k] = v
 	}
-	if msg.Partial {
+	if msg.PLogMetaData != nil {
 		vars["CONTAINER_PARTIAL_MESSAGE"] = "true"
 	}
 
 	line := string(msg.Line)
+	source := msg.Source
 	logger.PutMessage(msg)
 
-	if msg.Source == "stderr" {
+	if source == "stderr" {
 		return journal.Send(line, journal.PriErr, vars)
 	}
 	return journal.Send(line, journal.PriInfo, vars)

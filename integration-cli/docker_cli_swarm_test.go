@@ -4,7 +4,9 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -14,16 +16,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudflare/cfssl/helpers"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/integration-cli/checker"
+	"github.com/docker/docker/integration-cli/cli"
 	"github.com/docker/docker/integration-cli/daemon"
-	icmd "github.com/docker/docker/pkg/testutil/cmd"
 	"github.com/docker/libnetwork/driverapi"
 	"github.com/docker/libnetwork/ipamapi"
 	remoteipam "github.com/docker/libnetwork/ipams/remote/api"
+	"github.com/docker/swarmkit/ca/keyutils"
 	"github.com/go-check/check"
 	"github.com/vishvananda/netlink"
+	"gotest.tools/fs"
+	"gotest.tools/icmd"
 )
 
 func (s *DockerSwarmSuite) TestSwarmUpdate(c *check.C) {
@@ -47,6 +53,31 @@ func (s *DockerSwarmSuite) TestSwarmUpdate(c *check.C) {
 	c.Assert(out, checker.Contains, "minimum certificate expiry time")
 	spec = getSpec()
 	c.Assert(spec.CAConfig.NodeCertExpiry, checker.Equals, 30*time.Hour)
+
+	// passing an external CA (this is without starting a root rotation) does not fail
+	cli.Docker(cli.Args("swarm", "update", "--external-ca", "protocol=cfssl,url=https://something.org",
+		"--external-ca", "protocol=cfssl,url=https://somethingelse.org,cacert=fixtures/https/ca.pem"),
+		cli.Daemon(d)).Assert(c, icmd.Success)
+
+	expected, err := ioutil.ReadFile("fixtures/https/ca.pem")
+	c.Assert(err, checker.IsNil)
+
+	spec = getSpec()
+	c.Assert(spec.CAConfig.ExternalCAs, checker.HasLen, 2)
+	c.Assert(spec.CAConfig.ExternalCAs[0].CACert, checker.Equals, "")
+	c.Assert(spec.CAConfig.ExternalCAs[1].CACert, checker.Equals, string(expected))
+
+	// passing an invalid external CA fails
+	tempFile := fs.NewFile(c, "testfile", fs.WithContent("fakecert"))
+	defer tempFile.Remove()
+
+	result := cli.Docker(cli.Args("swarm", "update",
+		"--external-ca", fmt.Sprintf("protocol=cfssl,url=https://something.org,cacert=%s", tempFile.Path())),
+		cli.Daemon(d))
+	result.Assert(c, icmd.Expected{
+		ExitCode: 125,
+		Err:      "must be in PEM format",
+	})
 }
 
 func (s *DockerSwarmSuite) TestSwarmInit(c *check.C) {
@@ -57,17 +88,35 @@ func (s *DockerSwarmSuite) TestSwarmInit(c *check.C) {
 		return sw.Spec
 	}
 
-	out, err := d.Cmd("swarm", "init", "--cert-expiry", "30h", "--dispatcher-heartbeat", "11s")
-	c.Assert(err, checker.IsNil, check.Commentf("out: %v", out))
+	// passing an invalid external CA fails
+	tempFile := fs.NewFile(c, "testfile", fs.WithContent("fakecert"))
+	defer tempFile.Remove()
+
+	result := cli.Docker(cli.Args("swarm", "init", "--cert-expiry", "30h", "--dispatcher-heartbeat", "11s",
+		"--external-ca", fmt.Sprintf("protocol=cfssl,url=https://somethingelse.org,cacert=%s", tempFile.Path())),
+		cli.Daemon(d))
+	result.Assert(c, icmd.Expected{
+		ExitCode: 125,
+		Err:      "must be in PEM format",
+	})
+
+	cli.Docker(cli.Args("swarm", "init", "--cert-expiry", "30h", "--dispatcher-heartbeat", "11s",
+		"--external-ca", "protocol=cfssl,url=https://something.org",
+		"--external-ca", "protocol=cfssl,url=https://somethingelse.org,cacert=fixtures/https/ca.pem"),
+		cli.Daemon(d)).Assert(c, icmd.Success)
+
+	expected, err := ioutil.ReadFile("fixtures/https/ca.pem")
+	c.Assert(err, checker.IsNil)
 
 	spec := getSpec()
 	c.Assert(spec.CAConfig.NodeCertExpiry, checker.Equals, 30*time.Hour)
 	c.Assert(spec.Dispatcher.HeartbeatPeriod, checker.Equals, 11*time.Second)
+	c.Assert(spec.CAConfig.ExternalCAs, checker.HasLen, 2)
+	c.Assert(spec.CAConfig.ExternalCAs[0].CACert, checker.Equals, "")
+	c.Assert(spec.CAConfig.ExternalCAs[1].CACert, checker.Equals, string(expected))
 
-	c.Assert(d.Leave(true), checker.IsNil)
-	time.Sleep(500 * time.Millisecond) // https://github.com/docker/swarmkit/issues/1421
-	out, err = d.Cmd("swarm", "init")
-	c.Assert(err, checker.IsNil, check.Commentf("out: %v", out))
+	c.Assert(d.SwarmLeave(true), checker.IsNil)
+	cli.Docker(cli.Args("swarm", "init"), cli.Daemon(d)).Assert(c, icmd.Success)
 
 	spec = getSpec()
 	c.Assert(spec.CAConfig.NodeCertExpiry, checker.Equals, 90*24*time.Hour)
@@ -77,15 +126,12 @@ func (s *DockerSwarmSuite) TestSwarmInit(c *check.C) {
 func (s *DockerSwarmSuite) TestSwarmInitIPv6(c *check.C) {
 	testRequires(c, IPv6)
 	d1 := s.AddDaemon(c, false, false)
-	out, err := d1.Cmd("swarm", "init", "--listen-addr", "::1")
-	c.Assert(err, checker.IsNil, check.Commentf("out: %v", out))
+	cli.Docker(cli.Args("swarm", "init", "--listen-add", "::1"), cli.Daemon(d1)).Assert(c, icmd.Success)
 
 	d2 := s.AddDaemon(c, false, false)
-	out, err = d2.Cmd("swarm", "join", "::1")
-	c.Assert(err, checker.IsNil, check.Commentf("out: %v", out))
+	cli.Docker(cli.Args("swarm", "join", "::1"), cli.Daemon(d2)).Assert(c, icmd.Success)
 
-	out, err = d2.Cmd("info")
-	c.Assert(err, checker.IsNil, check.Commentf("out: %v", out))
+	out := cli.Docker(cli.Args("info"), cli.Daemon(d2)).Assert(c, icmd.Success).Combined()
 	c.Assert(out, checker.Contains, "Swarm: active")
 }
 
@@ -99,13 +145,12 @@ func (s *DockerSwarmSuite) TestSwarmInitUnspecifiedAdvertiseAddr(c *check.C) {
 func (s *DockerSwarmSuite) TestSwarmIncompatibleDaemon(c *check.C) {
 	// init swarm mode and stop a daemon
 	d := s.AddDaemon(c, true, true)
-	info, err := d.SwarmInfo()
-	c.Assert(err, checker.IsNil)
+	info := d.SwarmInfo(c)
 	c.Assert(info.LocalNodeState, checker.Equals, swarm.LocalNodeStateActive)
 	d.Stop(c)
 
 	// start a daemon with --cluster-store and --cluster-advertise
-	err = d.StartWithError("--cluster-store=consul://consuladdr:consulport/some/path", "--cluster-advertise=1.1.1.1:2375")
+	err := d.StartWithError("--cluster-store=consul://consuladdr:consulport/some/path", "--cluster-advertise=1.1.1.1:2375")
 	c.Assert(err, checker.NotNil)
 	content, err := d.ReadLogFile()
 	c.Assert(err, checker.IsNil)
@@ -123,17 +168,19 @@ func (s *DockerSwarmSuite) TestSwarmIncompatibleDaemon(c *check.C) {
 
 func (s *DockerSwarmSuite) TestSwarmServiceTemplatingHostname(c *check.C) {
 	d := s.AddDaemon(c, true, true)
+	hostname, err := d.Cmd("node", "inspect", "--format", "{{.Description.Hostname}}", "self")
+	c.Assert(err, checker.IsNil, check.Commentf(hostname))
 
-	out, err := d.Cmd("service", "create", "--name", "test", "--hostname", "{{.Service.Name}}-{{.Task.Slot}}", "busybox", "top")
+	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", "test", "--hostname", "{{.Service.Name}}-{{.Task.Slot}}-{{.Node.Hostname}}", "busybox", "top")
 	c.Assert(err, checker.IsNil, check.Commentf(out))
 
 	// make sure task has been deployed.
 	waitAndAssert(c, defaultReconciliationTimeout, d.CheckActiveContainerCount, checker.Equals, 1)
 
-	containers := d.ActiveContainers()
+	containers := d.ActiveContainers(c)
 	out, err = d.Cmd("inspect", "--type", "container", "--format", "{{.Config.Hostname}}", containers[0])
 	c.Assert(err, checker.IsNil, check.Commentf(out))
-	c.Assert(strings.Split(out, "\n")[0], checker.Equals, "test-1", check.Commentf("hostname with templating invalid"))
+	c.Assert(strings.Split(out, "\n")[0], checker.Equals, "test-1-"+strings.Split(hostname, "\n")[0], check.Commentf("hostname with templating invalid"))
 }
 
 // Test case for #24270
@@ -143,15 +190,15 @@ func (s *DockerSwarmSuite) TestSwarmServiceListFilter(c *check.C) {
 	name1 := "redis-cluster-md5"
 	name2 := "redis-cluster"
 	name3 := "other-cluster"
-	out, err := d.Cmd("service", "create", "--name", name1, "busybox", "top")
+	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name1, "busybox", "top")
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
 
-	out, err = d.Cmd("service", "create", "--name", name2, "busybox", "top")
+	out, err = d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name2, "busybox", "top")
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
 
-	out, err = d.Cmd("service", "create", "--name", name3, "busybox", "top")
+	out, err = d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name3, "busybox", "top")
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
 
@@ -201,7 +248,7 @@ func (s *DockerSwarmSuite) TestSwarmNodeTaskListFilter(c *check.C) {
 	d := s.AddDaemon(c, true, true)
 
 	name := "redis-cluster-md5"
-	out, err := d.Cmd("service", "create", "--name", name, "--replicas=3", "busybox", "top")
+	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name, "--replicas=3", "busybox", "top")
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
 
@@ -228,17 +275,17 @@ func (s *DockerSwarmSuite) TestSwarmPublishAdd(c *check.C) {
 	d := s.AddDaemon(c, true, true)
 
 	name := "top"
-	out, err := d.Cmd("service", "create", "--name", name, "--label", "x=y", "busybox", "top")
+	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name, "--label", "x=y", "busybox", "top")
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
 
-	out, err = d.Cmd("service", "update", "--publish-add", "80:80", name)
+	out, err = d.Cmd("service", "update", "--detach", "--publish-add", "80:80", name)
 	c.Assert(err, checker.IsNil)
 
-	out, err = d.CmdRetryOutOfSequence("service", "update", "--publish-add", "80:80", name)
+	out, err = d.Cmd("service", "update", "--detach", "--publish-add", "80:80", name)
 	c.Assert(err, checker.IsNil)
 
-	out, err = d.CmdRetryOutOfSequence("service", "update", "--publish-add", "80:80", "--publish-add", "80:20", name)
+	out, err = d.Cmd("service", "update", "--detach", "--publish-add", "80:80", "--publish-add", "80:20", name)
 	c.Assert(err, checker.NotNil)
 
 	out, err = d.Cmd("service", "inspect", "--format", "{{ .Spec.EndpointSpec.Ports }}", name)
@@ -250,7 +297,7 @@ func (s *DockerSwarmSuite) TestSwarmServiceWithGroup(c *check.C) {
 	d := s.AddDaemon(c, true, true)
 
 	name := "top"
-	out, err := d.Cmd("service", "create", "--name", name, "--user", "root:root", "--group", "wheel", "--group", "audio", "--group", "staff", "--group", "777", "busybox", "top")
+	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name, "--user", "root:root", "--group", "wheel", "--group", "audio", "--group", "staff", "--group", "777", "busybox", "top")
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
 
@@ -297,16 +344,21 @@ func (s *DockerSwarmSuite) TestSwarmContainerEndpointOptions(c *check.C) {
 	c.Assert(err, checker.IsNil, check.Commentf(out))
 	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
 
-	_, err = d.Cmd("run", "-d", "--net=foo", "--name=first", "--net-alias=first-alias", "busybox", "top")
+	_, err = d.Cmd("run", "-d", "--net=foo", "--name=first", "--net-alias=first-alias", "busybox:glibc", "top")
 	c.Assert(err, checker.IsNil, check.Commentf(out))
 
-	_, err = d.Cmd("run", "-d", "--net=foo", "--name=second", "busybox", "top")
+	_, err = d.Cmd("run", "-d", "--net=foo", "--name=second", "busybox:glibc", "top")
 	c.Assert(err, checker.IsNil, check.Commentf(out))
 
-	// ping first container and its alias
+	_, err = d.Cmd("run", "-d", "--net=foo", "--net-alias=third-alias", "busybox:glibc", "top")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	// ping first container and its alias, also ping third and anonymous container by its alias
 	_, err = d.Cmd("exec", "second", "ping", "-c", "1", "first")
 	c.Assert(err, check.IsNil, check.Commentf(out))
 	_, err = d.Cmd("exec", "second", "ping", "-c", "1", "first-alias")
+	c.Assert(err, check.IsNil, check.Commentf(out))
+	_, err = d.Cmd("exec", "second", "ping", "-c", "1", "third-alias")
 	c.Assert(err, check.IsNil, check.Commentf(out))
 }
 
@@ -373,7 +425,7 @@ func (s *DockerSwarmSuite) TestOverlayAttachableOnSwarmLeave(c *check.C) {
 	c.Assert(err, checker.IsNil, check.Commentf(out))
 
 	// Leave the swarm
-	err = d.Leave(true)
+	err = d.SwarmLeave(true)
 	c.Assert(err, checker.IsNil)
 
 	// Check the container is disconnected
@@ -398,7 +450,7 @@ func (s *DockerSwarmSuite) TestOverlayAttachableReleaseResourcesOnFailure(c *che
 	out, err = d.Cmd("run", "-d", "--network", "ovnet", "--name", "c1", "--ip", "10.10.9.33", "busybox", "top")
 	c.Assert(err, checker.IsNil, check.Commentf(out))
 
-	// Attempt to attach another contianer with same IP, must fail
+	// Attempt to attach another container with same IP, must fail
 	_, err = d.Cmd("run", "-d", "--network", "ovnet", "--name", "c2", "--ip", "10.10.9.33", "busybox", "top")
 	c.Assert(err, checker.NotNil)
 
@@ -411,14 +463,75 @@ func (s *DockerSwarmSuite) TestOverlayAttachableReleaseResourcesOnFailure(c *che
 	c.Assert(err, checker.IsNil, check.Commentf(out))
 }
 
-func (s *DockerSwarmSuite) TestSwarmRemoveInternalNetwork(c *check.C) {
+func (s *DockerSwarmSuite) TestSwarmIngressNetwork(c *check.C) {
 	d := s.AddDaemon(c, true, true)
 
-	name := "ingress"
-	out, err := d.Cmd("network", "rm", name)
+	// Ingress network can be removed
+	removeNetwork := func(name string) *icmd.Result {
+		return cli.Docker(
+			cli.Args("-H", d.Sock(), "network", "rm", name),
+			cli.WithStdin(strings.NewReader("Y")))
+	}
+
+	result := removeNetwork("ingress")
+	result.Assert(c, icmd.Success)
+
+	// And recreated
+	out, err := d.Cmd("network", "create", "-d", "overlay", "--ingress", "new-ingress")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	// But only one is allowed
+	out, err = d.Cmd("network", "create", "-d", "overlay", "--ingress", "another-ingress")
 	c.Assert(err, checker.NotNil)
-	c.Assert(strings.TrimSpace(out), checker.Contains, name)
-	c.Assert(strings.TrimSpace(out), checker.Contains, "is a pre-defined network and cannot be removed")
+	c.Assert(strings.TrimSpace(out), checker.Contains, "is already present")
+
+	// It cannot be removed if it is being used
+	out, err = d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", "srv1", "-p", "9000:8000", "busybox", "top")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	result = removeNetwork("new-ingress")
+	result.Assert(c, icmd.Expected{
+		ExitCode: 1,
+		Err:      "ingress network cannot be removed because service",
+	})
+
+	// But it can be removed once no more services depend on it
+	out, err = d.Cmd("service", "update", "--detach", "--publish-rm", "9000:8000", "srv1")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	result = removeNetwork("new-ingress")
+	result.Assert(c, icmd.Success)
+
+	// A service which needs the ingress network cannot be created if no ingress is present
+	out, err = d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", "srv2", "-p", "500:500", "busybox", "top")
+	c.Assert(err, checker.NotNil)
+	c.Assert(strings.TrimSpace(out), checker.Contains, "no ingress network is present")
+
+	// An existing service cannot be updated to use the ingress nw if the nw is not present
+	out, err = d.Cmd("service", "update", "--detach", "--publish-add", "9000:8000", "srv1")
+	c.Assert(err, checker.NotNil)
+	c.Assert(strings.TrimSpace(out), checker.Contains, "no ingress network is present")
+
+	// But services which do not need routing mesh can be created regardless
+	out, err = d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", "srv3", "--endpoint-mode", "dnsrr", "busybox", "top")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+}
+
+func (s *DockerSwarmSuite) TestSwarmCreateServiceWithNoIngressNetwork(c *check.C) {
+	d := s.AddDaemon(c, true, true)
+
+	// Remove ingress network
+	result := cli.Docker(
+		cli.Args("-H", d.Sock(), "network", "rm", "ingress"),
+		cli.WithStdin(strings.NewReader("Y")))
+	result.Assert(c, icmd.Success)
+
+	// Create a overlay network and launch a service on it
+	// Make sure nothing panics because ingress network is missing
+	out, err := d.Cmd("network", "create", "-d", "overlay", "another-network")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	out, err = d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", "srv4", "--network", "another-network", "busybox", "top")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
 }
 
 // Test case for #24108, also the case from:
@@ -427,7 +540,7 @@ func (s *DockerSwarmSuite) TestSwarmTaskListFilter(c *check.C) {
 	d := s.AddDaemon(c, true, true)
 
 	name := "redis-cluster-md5"
-	out, err := d.Cmd("service", "create", "--name", name, "--replicas=3", "busybox", "top")
+	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name, "--replicas=3", "busybox", "top")
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
 
@@ -461,7 +574,7 @@ func (s *DockerSwarmSuite) TestSwarmTaskListFilter(c *check.C) {
 	c.Assert(out, checker.Not(checker.Contains), name+".3")
 
 	name = "redis-cluster-sha1"
-	out, err = d.Cmd("service", "create", "--name", name, "--mode=global", "busybox", "top")
+	out, err = d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name, "--mode=global", "busybox", "top")
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
 
@@ -490,7 +603,7 @@ func (s *DockerSwarmSuite) TestPsListContainersFilterIsTask(c *check.C) {
 	bareID := strings.TrimSpace(out)[:12]
 	// Create a service
 	name := "busybox-top"
-	out, err = d.Cmd("service", "create", "--name", name, "busybox", "top")
+	out, err = d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name, "busybox", "top")
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
 
@@ -709,7 +822,7 @@ func (s *DockerSwarmSuite) TestSwarmServiceEnvFile(c *check.C) {
 	c.Assert(err, checker.IsNil)
 
 	name := "worker"
-	out, err := d.Cmd("service", "create", "--env-file", path, "--env", "VAR1=B", "--env", "VAR1=C", "--env", "VAR2=", "--env", "VAR2", "--name", name, "busybox", "top")
+	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--env-file", path, "--env", "VAR1=B", "--env", "VAR1=C", "--env", "VAR2=", "--env", "VAR2", "--name", name, "busybox", "top")
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
 
@@ -728,14 +841,14 @@ func (s *DockerSwarmSuite) TestSwarmServiceTTY(c *check.C) {
 
 	// Without --tty
 	expectedOutput := "none"
-	out, err := d.Cmd("service", "create", "--name", name, "busybox", "sh", "-c", ttyCheck)
+	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name, "busybox", "sh", "-c", ttyCheck)
 	c.Assert(err, checker.IsNil)
 
 	// Make sure task has been deployed.
 	waitAndAssert(c, defaultReconciliationTimeout, d.CheckActiveContainerCount, checker.Equals, 1)
 
 	// We need to get the container id.
-	out, err = d.Cmd("ps", "-a", "-q", "--no-trunc")
+	out, err = d.Cmd("ps", "-q", "--no-trunc")
 	c.Assert(err, checker.IsNil)
 	id := strings.TrimSpace(out)
 
@@ -751,14 +864,14 @@ func (s *DockerSwarmSuite) TestSwarmServiceTTY(c *check.C) {
 
 	// With --tty
 	expectedOutput = "TTY"
-	out, err = d.Cmd("service", "create", "--name", name, "--tty", "busybox", "sh", "-c", ttyCheck)
+	out, err = d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name, "--tty", "busybox", "sh", "-c", ttyCheck)
 	c.Assert(err, checker.IsNil)
 
 	// Make sure task has been deployed.
 	waitAndAssert(c, defaultReconciliationTimeout, d.CheckActiveContainerCount, checker.Equals, 1)
 
 	// We need to get the container id.
-	out, err = d.Cmd("ps", "-a", "-q", "--no-trunc")
+	out, err = d.Cmd("ps", "-q", "--no-trunc")
 	c.Assert(err, checker.IsNil)
 	id = strings.TrimSpace(out)
 
@@ -772,7 +885,7 @@ func (s *DockerSwarmSuite) TestSwarmServiceTTYUpdate(c *check.C) {
 
 	// Create a service
 	name := "top"
-	_, err := d.Cmd("service", "create", "--name", name, "busybox", "top")
+	_, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name, "busybox", "top")
 	c.Assert(err, checker.IsNil)
 
 	// Make sure task has been deployed.
@@ -782,7 +895,7 @@ func (s *DockerSwarmSuite) TestSwarmServiceTTYUpdate(c *check.C) {
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Equals, "false")
 
-	_, err = d.Cmd("service", "update", "--tty", name)
+	_, err = d.Cmd("service", "update", "--detach", "--tty", name)
 	c.Assert(err, checker.IsNil)
 
 	out, err = d.Cmd("service", "inspect", "--format", "{{ .Spec.TaskTemplate.ContainerSpec.TTY }}", name)
@@ -790,12 +903,51 @@ func (s *DockerSwarmSuite) TestSwarmServiceTTYUpdate(c *check.C) {
 	c.Assert(strings.TrimSpace(out), checker.Equals, "true")
 }
 
+func (s *DockerSwarmSuite) TestSwarmServiceNetworkUpdate(c *check.C) {
+	d := s.AddDaemon(c, true, true)
+
+	result := icmd.RunCmd(d.Command("network", "create", "-d", "overlay", "foo"))
+	result.Assert(c, icmd.Success)
+	fooNetwork := strings.TrimSpace(string(result.Combined()))
+
+	result = icmd.RunCmd(d.Command("network", "create", "-d", "overlay", "bar"))
+	result.Assert(c, icmd.Success)
+	barNetwork := strings.TrimSpace(string(result.Combined()))
+
+	result = icmd.RunCmd(d.Command("network", "create", "-d", "overlay", "baz"))
+	result.Assert(c, icmd.Success)
+	bazNetwork := strings.TrimSpace(string(result.Combined()))
+
+	// Create a service
+	name := "top"
+	result = icmd.RunCmd(d.Command("service", "create", "--detach", "--no-resolve-image", "--network", "foo", "--network", "bar", "--name", name, "busybox", "top"))
+	result.Assert(c, icmd.Success)
+
+	// Make sure task has been deployed.
+	waitAndAssert(c, defaultReconciliationTimeout, d.CheckRunningTaskNetworks, checker.DeepEquals,
+		map[string]int{fooNetwork: 1, barNetwork: 1})
+
+	// Remove a network
+	result = icmd.RunCmd(d.Command("service", "update", "--detach", "--network-rm", "foo", name))
+	result.Assert(c, icmd.Success)
+
+	waitAndAssert(c, defaultReconciliationTimeout, d.CheckRunningTaskNetworks, checker.DeepEquals,
+		map[string]int{barNetwork: 1})
+
+	// Add a network
+	result = icmd.RunCmd(d.Command("service", "update", "--detach", "--network-add", "baz", name))
+	result.Assert(c, icmd.Success)
+
+	waitAndAssert(c, defaultReconciliationTimeout, d.CheckRunningTaskNetworks, checker.DeepEquals,
+		map[string]int{barNetwork: 1, bazNetwork: 1})
+}
+
 func (s *DockerSwarmSuite) TestDNSConfig(c *check.C) {
 	d := s.AddDaemon(c, true, true)
 
 	// Create a service
 	name := "top"
-	_, err := d.Cmd("service", "create", "--name", name, "--dns=1.2.3.4", "--dns-search=example.com", "--dns-option=timeout:3", "busybox", "top")
+	_, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name, "--dns=1.2.3.4", "--dns-search=example.com", "--dns-option=timeout:3", "busybox", "top")
 	c.Assert(err, checker.IsNil)
 
 	// Make sure task has been deployed.
@@ -822,13 +974,13 @@ func (s *DockerSwarmSuite) TestDNSConfigUpdate(c *check.C) {
 
 	// Create a service
 	name := "top"
-	_, err := d.Cmd("service", "create", "--name", name, "busybox", "top")
+	_, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name, "busybox", "top")
 	c.Assert(err, checker.IsNil)
 
 	// Make sure task has been deployed.
 	waitAndAssert(c, defaultReconciliationTimeout, d.CheckActiveContainerCount, checker.Equals, 1)
 
-	_, err = d.Cmd("service", "update", "--dns-add=1.2.3.4", "--dns-search-add=example.com", "--dns-option-add=timeout:3", name)
+	_, err = d.Cmd("service", "update", "--detach", "--dns-add=1.2.3.4", "--dns-search-add=example.com", "--dns-option-add=timeout:3", name)
 	c.Assert(err, checker.IsNil)
 
 	out, err := d.Cmd("service", "inspect", "--format", "{{ .Spec.TaskTemplate.ContainerSpec.DNSConfig }}", name)
@@ -836,38 +988,40 @@ func (s *DockerSwarmSuite) TestDNSConfigUpdate(c *check.C) {
 	c.Assert(strings.TrimSpace(out), checker.Equals, "{[1.2.3.4] [example.com] [timeout:3]}")
 }
 
-func getNodeStatus(c *check.C, d *daemon.Swarm) swarm.LocalNodeState {
-	info, err := d.SwarmInfo()
-	c.Assert(err, checker.IsNil)
+func getNodeStatus(c *check.C, d *daemon.Daemon) swarm.LocalNodeState {
+	info := d.SwarmInfo(c)
 	return info.LocalNodeState
 }
 
-func checkSwarmLockedToUnlocked(c *check.C, d *daemon.Swarm, unlockKey string) {
-	d.Restart(c)
-	status := getNodeStatus(c, d)
-	if status == swarm.LocalNodeStateLocked {
-		// it must not have updated to be unlocked in time - unlock, wait 3 seconds, and try again
-		cmd := d.Command("swarm", "unlock")
-		cmd.Stdin = bytes.NewBufferString(unlockKey)
-		icmd.RunCmd(cmd).Assert(c, icmd.Success)
+func checkKeyIsEncrypted(d *daemon.Daemon) func(*check.C) (interface{}, check.CommentInterface) {
+	return func(c *check.C) (interface{}, check.CommentInterface) {
+		keyBytes, err := ioutil.ReadFile(filepath.Join(d.Folder, "root", "swarm", "certificates", "swarm-node.key"))
+		if err != nil {
+			return fmt.Errorf("error reading key: %v", err), nil
+		}
 
-		c.Assert(getNodeStatus(c, d), checker.Equals, swarm.LocalNodeStateActive)
+		keyBlock, _ := pem.Decode(keyBytes)
+		if keyBlock == nil {
+			return fmt.Errorf("invalid PEM-encoded private key"), nil
+		}
 
-		time.Sleep(3 * time.Second)
-		d.Restart(c)
+		return keyutils.IsEncryptedPEMBlock(keyBlock), nil
 	}
+}
 
+func checkSwarmLockedToUnlocked(c *check.C, d *daemon.Daemon, unlockKey string) {
+	// Wait for the PEM file to become unencrypted
+	waitAndAssert(c, defaultReconciliationTimeout, checkKeyIsEncrypted(d), checker.Equals, false)
+
+	d.Restart(c)
 	c.Assert(getNodeStatus(c, d), checker.Equals, swarm.LocalNodeStateActive)
 }
 
-func checkSwarmUnlockedToLocked(c *check.C, d *daemon.Swarm) {
+func checkSwarmUnlockedToLocked(c *check.C, d *daemon.Daemon) {
+	// Wait for the PEM file to become encrypted
+	waitAndAssert(c, defaultReconciliationTimeout, checkKeyIsEncrypted(d), checker.Equals, true)
+
 	d.Restart(c)
-	status := getNodeStatus(c, d)
-	if status == swarm.LocalNodeStateActive {
-		// it must not have updated to be unlocked in time - wait 3 seconds, and try again
-		time.Sleep(3 * time.Second)
-		d.Restart(c)
-	}
 	c.Assert(getNodeStatus(c, d), checker.Equals, swarm.LocalNodeStateLocked)
 }
 
@@ -961,8 +1115,7 @@ func (s *DockerSwarmSuite) TestSwarmLeaveLocked(c *check.C) {
 	// It starts off locked
 	d.Restart(c, "--swarm-default-advertise-addr=lo")
 
-	info, err := d.SwarmInfo()
-	c.Assert(err, checker.IsNil)
+	info := d.SwarmInfo(c)
 	c.Assert(info.LocalNodeState, checker.Equals, swarm.LocalNodeStateLocked)
 
 	outs, _ = d.Cmd("node", "ls")
@@ -976,15 +1129,13 @@ func (s *DockerSwarmSuite) TestSwarmLeaveLocked(c *check.C) {
 	outs, err = d.Cmd("swarm", "leave", "--force")
 	c.Assert(err, checker.IsNil, check.Commentf("out: %v", outs))
 
-	info, err = d.SwarmInfo()
-	c.Assert(err, checker.IsNil)
+	info = d.SwarmInfo(c)
 	c.Assert(info.LocalNodeState, checker.Equals, swarm.LocalNodeStateInactive)
 
 	outs, err = d.Cmd("swarm", "init")
 	c.Assert(err, checker.IsNil, check.Commentf("out: %v", outs))
 
-	info, err = d.SwarmInfo()
-	c.Assert(err, checker.IsNil)
+	info = d.SwarmInfo(c)
 	c.Assert(info.LocalNodeState, checker.Equals, swarm.LocalNodeStateActive)
 }
 
@@ -1020,7 +1171,7 @@ func (s *DockerSwarmSuite) TestSwarmLockUnlockCluster(c *check.C) {
 	c.Assert(outs, checker.Equals, unlockKey+"\n")
 
 	// The ones that got the cluster update should be set to locked
-	for _, d := range []*daemon.Swarm{d1, d3} {
+	for _, d := range []*daemon.Daemon{d1, d3} {
 		checkSwarmUnlockedToLocked(c, d)
 
 		cmd := d.Command("swarm", "unlock")
@@ -1041,7 +1192,7 @@ func (s *DockerSwarmSuite) TestSwarmLockUnlockCluster(c *check.C) {
 	c.Assert(err, checker.IsNil, check.Commentf("out: %v", outs))
 
 	// the ones that got the update are now set to unlocked
-	for _, d := range []*daemon.Swarm{d1, d3} {
+	for _, d := range []*daemon.Daemon{d1, d3} {
 		checkSwarmLockedToUnlocked(c, d, unlockKey)
 	}
 
@@ -1091,7 +1242,7 @@ func (s *DockerSwarmSuite) TestSwarmJoinPromoteLocked(c *check.C) {
 	c.Assert(getNodeStatus(c, d2), checker.Equals, swarm.LocalNodeStateActive)
 
 	// promote worker
-	outs, err = d1.Cmd("node", "promote", d2.Info.NodeID)
+	outs, err = d1.Cmd("node", "promote", d2.NodeID())
 	c.Assert(err, checker.IsNil)
 	c.Assert(outs, checker.Contains, "promoted to a manager in the swarm")
 
@@ -1099,7 +1250,7 @@ func (s *DockerSwarmSuite) TestSwarmJoinPromoteLocked(c *check.C) {
 	d3 := s.AddDaemon(c, true, true)
 
 	// both new nodes are locked
-	for _, d := range []*daemon.Swarm{d2, d3} {
+	for _, d := range []*daemon.Daemon{d2, d3} {
 		checkSwarmUnlockedToLocked(c, d)
 
 		cmd := d.Command("swarm", "unlock")
@@ -1108,12 +1259,8 @@ func (s *DockerSwarmSuite) TestSwarmJoinPromoteLocked(c *check.C) {
 		c.Assert(getNodeStatus(c, d), checker.Equals, swarm.LocalNodeStateActive)
 	}
 
-	// get d3's cert
-	d3cert, err := ioutil.ReadFile(filepath.Join(d3.Folder, "root", "swarm", "certificates", "swarm-node.crt"))
-	c.Assert(err, checker.IsNil)
-
 	// demote manager back to worker - workers are not locked
-	outs, err = d1.Cmd("node", "demote", d3.Info.NodeID)
+	outs, err = d1.Cmd("node", "demote", d3.NodeID())
 	c.Assert(err, checker.IsNil)
 	c.Assert(outs, checker.Contains, "demoted in the swarm")
 
@@ -1124,12 +1271,16 @@ func (s *DockerSwarmSuite) TestSwarmJoinPromoteLocked(c *check.C) {
 	// is set to autolock)
 	waitAndAssert(c, defaultReconciliationTimeout, d3.CheckControlAvailable, checker.False)
 	waitAndAssert(c, defaultReconciliationTimeout, func(c *check.C) (interface{}, check.CommentInterface) {
-		cert, err := ioutil.ReadFile(filepath.Join(d3.Folder, "root", "swarm", "certificates", "swarm-node.crt"))
+		certBytes, err := ioutil.ReadFile(filepath.Join(d3.Folder, "root", "swarm", "certificates", "swarm-node.crt"))
 		if err != nil {
 			return "", check.Commentf("error: %v", err)
 		}
-		return string(cert), check.Commentf("cert: %v", string(cert))
-	}, checker.Not(checker.Equals), string(d3cert))
+		certs, err := helpers.ParseCertificatesPEM(certBytes)
+		if err == nil && len(certs) > 0 && len(certs[0].Subject.OrganizationalUnit) > 0 {
+			return certs[0].Subject.OrganizationalUnit[0], nil
+		}
+		return "", check.Commentf("could not get organizational unit from certificate")
+	}, checker.Equals, "swarm-worker")
 
 	// by now, it should *never* be locked on restart
 	d3.Restart(c)
@@ -1253,7 +1404,7 @@ func (s *DockerSwarmSuite) TestSwarmClusterRotateUnlockKey(c *check.C) {
 		d2.Restart(c)
 		d3.Restart(c)
 
-		for _, d := range []*daemon.Swarm{d2, d3} {
+		for _, d := range []*daemon.Daemon{d2, d3} {
 			c.Assert(getNodeStatus(c, d), checker.Equals, swarm.LocalNodeStateLocked)
 
 			outs, _ := d.Cmd("node", "ls")
@@ -1341,7 +1492,7 @@ func (s *DockerSwarmSuite) TestExtraHosts(c *check.C) {
 
 	// Create a service
 	name := "top"
-	_, err := d.Cmd("service", "create", "--name", name, "--host=example.com:1.2.3.4", "busybox", "top")
+	_, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", name, "--host=example.com:1.2.3.4", "busybox", "top")
 	c.Assert(err, checker.IsNil)
 
 	// Make sure task has been deployed.
@@ -1365,7 +1516,7 @@ func (s *DockerSwarmSuite) TestSwarmManagerAddress(c *check.C) {
 	d3 := s.AddDaemon(c, true, false)
 
 	// Manager Addresses will always show Node 1's address
-	expectedOutput := fmt.Sprintf("Manager Addresses:\n  127.0.0.1:%d\n", d1.Port)
+	expectedOutput := fmt.Sprintf("Manager Addresses:\n  127.0.0.1:%d\n", d1.SwarmPort)
 
 	out, err := d1.Cmd("info")
 	c.Assert(err, checker.IsNil)
@@ -1380,22 +1531,6 @@ func (s *DockerSwarmSuite) TestSwarmManagerAddress(c *check.C) {
 	c.Assert(out, checker.Contains, expectedOutput)
 }
 
-func (s *DockerSwarmSuite) TestSwarmServiceInspectPretty(c *check.C) {
-	d := s.AddDaemon(c, true, true)
-
-	name := "top"
-	out, err := d.Cmd("service", "create", "--name", name, "--limit-cpu=0.5", "busybox", "top")
-	c.Assert(err, checker.IsNil, check.Commentf(out))
-
-	expectedOutput := `
-Resources:
- Limits:
-  CPU:		0.5`
-	out, err = d.Cmd("service", "inspect", "--pretty", name)
-	c.Assert(err, checker.IsNil, check.Commentf(out))
-	c.Assert(out, checker.Contains, expectedOutput, check.Commentf(out))
-}
-
 func (s *DockerSwarmSuite) TestSwarmNetworkIPAMOptions(c *check.C) {
 	d := s.AddDaemon(c, true, true)
 
@@ -1405,9 +1540,10 @@ func (s *DockerSwarmSuite) TestSwarmNetworkIPAMOptions(c *check.C) {
 
 	out, err = d.Cmd("network", "inspect", "--format", "{{.IPAM.Options}}", "foo")
 	c.Assert(err, checker.IsNil, check.Commentf(out))
-	c.Assert(strings.TrimSpace(out), checker.Equals, "map[foo:bar]")
+	c.Assert(strings.TrimSpace(out), checker.Contains, "foo:bar")
+	c.Assert(strings.TrimSpace(out), checker.Contains, "com.docker.network.ipam.serial:true")
 
-	out, err = d.Cmd("service", "create", "--network=foo", "--name", "top", "busybox", "top")
+	out, err = d.Cmd("service", "create", "--detach", "--no-resolve-image", "--network=foo", "--name", "top", "busybox", "top")
 	c.Assert(err, checker.IsNil, check.Commentf(out))
 
 	// make sure task has been deployed.
@@ -1415,84 +1551,8 @@ func (s *DockerSwarmSuite) TestSwarmNetworkIPAMOptions(c *check.C) {
 
 	out, err = d.Cmd("network", "inspect", "--format", "{{.IPAM.Options}}", "foo")
 	c.Assert(err, checker.IsNil, check.Commentf(out))
-	c.Assert(strings.TrimSpace(out), checker.Equals, "map[foo:bar]")
-}
-
-func (s *DockerTrustedSwarmSuite) TestTrustedServiceCreate(c *check.C) {
-	d := s.swarmSuite.AddDaemon(c, true, true)
-
-	// Attempt creating a service from an image that is known to notary.
-	repoName := s.trustSuite.setupTrustedImage(c, "trusted-pull")
-
-	name := "trusted"
-	serviceCmd := d.Command("-D", "service", "create", "--name", name, repoName, "top")
-	icmd.RunCmd(serviceCmd, trustedCmd).Assert(c, icmd.Expected{
-		Err: "resolved image tag to",
-	})
-
-	out, err := d.Cmd("service", "inspect", "--pretty", name)
-	c.Assert(err, checker.IsNil, check.Commentf(out))
-	c.Assert(out, checker.Contains, repoName+"@", check.Commentf(out))
-
-	// Try trusted service create on an untrusted tag.
-
-	repoName = fmt.Sprintf("%v/untrustedservicecreate/createtest:latest", privateRegistryURL)
-	// tag the image and upload it to the private registry
-	dockerCmd(c, "tag", "busybox", repoName)
-	dockerCmd(c, "push", repoName)
-	dockerCmd(c, "rmi", repoName)
-
-	name = "untrusted"
-	serviceCmd = d.Command("service", "create", "--name", name, repoName, "top")
-	icmd.RunCmd(serviceCmd, trustedCmd).Assert(c, icmd.Expected{
-		ExitCode: 1,
-		Err:      "Error: remote trust data does not exist",
-	})
-
-	out, err = d.Cmd("service", "inspect", "--pretty", name)
-	c.Assert(err, checker.NotNil, check.Commentf(out))
-}
-
-func (s *DockerTrustedSwarmSuite) TestTrustedServiceUpdate(c *check.C) {
-	d := s.swarmSuite.AddDaemon(c, true, true)
-
-	// Attempt creating a service from an image that is known to notary.
-	repoName := s.trustSuite.setupTrustedImage(c, "trusted-pull")
-
-	name := "myservice"
-
-	// Create a service without content trust
-	_, err := d.Cmd("service", "create", "--name", name, repoName, "top")
-	c.Assert(err, checker.IsNil)
-
-	out, err := d.Cmd("service", "inspect", "--pretty", name)
-	c.Assert(err, checker.IsNil, check.Commentf(out))
-	// Daemon won't insert the digest because this is disabled by
-	// DOCKER_SERVICE_PREFER_OFFLINE_IMAGE.
-	c.Assert(out, check.Not(checker.Contains), repoName+"@", check.Commentf(out))
-
-	serviceCmd := d.Command("-D", "service", "update", "--image", repoName, name)
-	icmd.RunCmd(serviceCmd, trustedCmd).Assert(c, icmd.Expected{
-		Err: "resolved image tag to",
-	})
-
-	out, err = d.Cmd("service", "inspect", "--pretty", name)
-	c.Assert(err, checker.IsNil, check.Commentf(out))
-	c.Assert(out, checker.Contains, repoName+"@", check.Commentf(out))
-
-	// Try trusted service update on an untrusted tag.
-
-	repoName = fmt.Sprintf("%v/untrustedservicecreate/createtest:latest", privateRegistryURL)
-	// tag the image and upload it to the private registry
-	dockerCmd(c, "tag", "busybox", repoName)
-	dockerCmd(c, "push", repoName)
-	dockerCmd(c, "rmi", repoName)
-
-	serviceCmd = d.Command("service", "update", "--image", repoName, name)
-	icmd.RunCmd(serviceCmd, trustedCmd).Assert(c, icmd.Expected{
-		ExitCode: 1,
-		Err:      "Error: remote trust data does not exist",
-	})
+	c.Assert(strings.TrimSpace(out), checker.Contains, "foo:bar")
+	c.Assert(strings.TrimSpace(out), checker.Contains, "com.docker.network.ipam.serial:true")
 }
 
 // Test case for issue #27866, which did not allow NW name that is the prefix of a swarm NW ID.
@@ -1542,80 +1602,10 @@ func (s *DockerSwarmSuite) TestSwarmNetworkCreateDup(c *check.C) {
 	}
 }
 
-func (s *DockerSwarmSuite) TestSwarmServicePsMultipleServiceIDs(c *check.C) {
-	d := s.AddDaemon(c, true, true)
-
-	name1 := "top1"
-	out, err := d.Cmd("service", "create", "--name", name1, "--replicas=3", "busybox", "top")
-	c.Assert(err, checker.IsNil)
-	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
-	id1 := strings.TrimSpace(out)
-
-	name2 := "top2"
-	out, err = d.Cmd("service", "create", "--name", name2, "--replicas=3", "busybox", "top")
-	c.Assert(err, checker.IsNil)
-	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
-	id2 := strings.TrimSpace(out)
-
-	// make sure task has been deployed.
-	waitAndAssert(c, defaultReconciliationTimeout, d.CheckActiveContainerCount, checker.Equals, 6)
-
-	out, err = d.Cmd("service", "ps", name1)
-	c.Assert(err, checker.IsNil)
-	c.Assert(out, checker.Contains, name1+".1")
-	c.Assert(out, checker.Contains, name1+".2")
-	c.Assert(out, checker.Contains, name1+".3")
-	c.Assert(out, checker.Not(checker.Contains), name2+".1")
-	c.Assert(out, checker.Not(checker.Contains), name2+".2")
-	c.Assert(out, checker.Not(checker.Contains), name2+".3")
-
-	out, err = d.Cmd("service", "ps", name1, name2)
-	c.Assert(err, checker.IsNil)
-	c.Assert(out, checker.Contains, name1+".1")
-	c.Assert(out, checker.Contains, name1+".2")
-	c.Assert(out, checker.Contains, name1+".3")
-	c.Assert(out, checker.Contains, name2+".1")
-	c.Assert(out, checker.Contains, name2+".2")
-	c.Assert(out, checker.Contains, name2+".3")
-
-	// Name Prefix
-	out, err = d.Cmd("service", "ps", "to")
-	c.Assert(err, checker.IsNil)
-	c.Assert(out, checker.Contains, name1+".1")
-	c.Assert(out, checker.Contains, name1+".2")
-	c.Assert(out, checker.Contains, name1+".3")
-	c.Assert(out, checker.Contains, name2+".1")
-	c.Assert(out, checker.Contains, name2+".2")
-	c.Assert(out, checker.Contains, name2+".3")
-
-	// Name Prefix (no hit)
-	out, err = d.Cmd("service", "ps", "noname")
-	c.Assert(err, checker.NotNil)
-	c.Assert(out, checker.Contains, "no such services: noname")
-
-	out, err = d.Cmd("service", "ps", id1)
-	c.Assert(err, checker.IsNil)
-	c.Assert(out, checker.Contains, name1+".1")
-	c.Assert(out, checker.Contains, name1+".2")
-	c.Assert(out, checker.Contains, name1+".3")
-	c.Assert(out, checker.Not(checker.Contains), name2+".1")
-	c.Assert(out, checker.Not(checker.Contains), name2+".2")
-	c.Assert(out, checker.Not(checker.Contains), name2+".3")
-
-	out, err = d.Cmd("service", "ps", id1, id2)
-	c.Assert(err, checker.IsNil)
-	c.Assert(out, checker.Contains, name1+".1")
-	c.Assert(out, checker.Contains, name1+".2")
-	c.Assert(out, checker.Contains, name1+".3")
-	c.Assert(out, checker.Contains, name2+".1")
-	c.Assert(out, checker.Contains, name2+".2")
-	c.Assert(out, checker.Contains, name2+".3")
-}
-
 func (s *DockerSwarmSuite) TestSwarmPublishDuplicatePorts(c *check.C) {
 	d := s.AddDaemon(c, true, true)
 
-	out, err := d.Cmd("service", "create", "--publish", "5005:80", "--publish", "5006:80", "--publish", "80", "--publish", "80", "busybox", "top")
+	out, err := d.Cmd("service", "create", "--no-resolve-image", "--detach=true", "--publish", "5005:80", "--publish", "5006:80", "--publish", "80", "--publish", "80", "busybox", "top")
 	c.Assert(err, check.IsNil, check.Commentf(out))
 	id := strings.TrimSpace(out)
 
@@ -1646,7 +1636,7 @@ func (s *DockerSwarmSuite) TestSwarmJoinWithDrain(c *check.C) {
 
 	d1 := s.AddDaemon(c, false, false)
 
-	out, err = d1.Cmd("swarm", "join", "--availability=drain", "--token", token, d.ListenAddr)
+	out, err = d1.Cmd("swarm", "join", "--availability=drain", "--token", token, d.SwarmListenAddr())
 	c.Assert(err, checker.IsNil)
 	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
 
@@ -1675,7 +1665,7 @@ func (s *DockerSwarmSuite) TestSwarmReadonlyRootfs(c *check.C) {
 
 	d := s.AddDaemon(c, true, true)
 
-	out, err := d.Cmd("service", "create", "--name", "top", "--read-only", "busybox", "top")
+	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", "top", "--read-only", "busybox", "top")
 	c.Assert(err, checker.IsNil, check.Commentf(out))
 
 	// make sure task has been deployed.
@@ -1685,7 +1675,7 @@ func (s *DockerSwarmSuite) TestSwarmReadonlyRootfs(c *check.C) {
 	c.Assert(err, checker.IsNil, check.Commentf(out))
 	c.Assert(strings.TrimSpace(out), checker.Equals, "true")
 
-	containers := d.ActiveContainers()
+	containers := d.ActiveContainers(c)
 	out, err = d.Cmd("inspect", "--type", "container", "--format", "{{.HostConfig.ReadonlyRootfs}}", containers[0])
 	c.Assert(err, checker.IsNil, check.Commentf(out))
 	c.Assert(strings.TrimSpace(out), checker.Equals, "true")
@@ -1695,19 +1685,17 @@ func (s *DockerSwarmSuite) TestNetworkInspectWithDuplicateNames(c *check.C) {
 	d := s.AddDaemon(c, true, true)
 
 	name := "foo"
-	networkCreateRequest := types.NetworkCreateRequest{
-		Name: name,
-		NetworkCreate: types.NetworkCreate{
-			CheckDuplicate: false,
-			Driver:         "bridge",
-		},
+	options := types.NetworkCreate{
+		CheckDuplicate: false,
+		Driver:         "bridge",
 	}
 
-	var n1 types.NetworkCreateResponse
-	status, body, err := d.SockRequest("POST", "/networks/create", networkCreateRequest)
-	c.Assert(err, checker.IsNil, check.Commentf(string(body)))
-	c.Assert(status, checker.Equals, http.StatusCreated, check.Commentf(string(body)))
-	c.Assert(json.Unmarshal(body, &n1), checker.IsNil)
+	cli, err := d.NewClient()
+	c.Assert(err, checker.IsNil)
+	defer cli.Close()
+
+	n1, err := cli.NetworkCreate(context.Background(), name, options)
+	c.Assert(err, checker.IsNil)
 
 	// Full ID always works
 	out, err := d.Cmd("network", "inspect", "--format", "{{.ID}}", n1.ID)
@@ -1719,12 +1707,8 @@ func (s *DockerSwarmSuite) TestNetworkInspectWithDuplicateNames(c *check.C) {
 	c.Assert(err, checker.IsNil, check.Commentf(out))
 	c.Assert(strings.TrimSpace(out), checker.Equals, n1.ID)
 
-	var n2 types.NetworkCreateResponse
-	status, body, err = d.SockRequest("POST", "/networks/create", networkCreateRequest)
-	c.Assert(err, checker.IsNil, check.Commentf(string(body)))
-	c.Assert(status, checker.Equals, http.StatusCreated, check.Commentf(string(body)))
-	c.Assert(json.Unmarshal(body, &n2), checker.IsNil)
-
+	n2, err := cli.NetworkCreate(context.Background(), name, options)
+	c.Assert(err, checker.IsNil)
 	// Full ID always works
 	out, err = d.Cmd("network", "inspect", "--format", "{{.ID}}", n1.ID)
 	c.Assert(err, checker.IsNil, check.Commentf(out))
@@ -1737,18 +1721,16 @@ func (s *DockerSwarmSuite) TestNetworkInspectWithDuplicateNames(c *check.C) {
 	// Name with duplicates
 	out, err = d.Cmd("network", "inspect", "--format", "{{.ID}}", name)
 	c.Assert(err, checker.NotNil, check.Commentf(out))
-	c.Assert(out, checker.Contains, "network foo is ambiguous (2 matches found based on name)")
+	c.Assert(out, checker.Contains, "2 matches found based on name")
 
 	out, err = d.Cmd("network", "rm", n2.ID)
 	c.Assert(err, checker.IsNil, check.Commentf(out))
 
 	// Dupliates with name but with different driver
-	networkCreateRequest.NetworkCreate.Driver = "overlay"
+	options.Driver = "overlay"
 
-	status, body, err = d.SockRequest("POST", "/networks/create", networkCreateRequest)
-	c.Assert(err, checker.IsNil, check.Commentf(string(body)))
-	c.Assert(status, checker.Equals, http.StatusCreated, check.Commentf(string(body)))
-	c.Assert(json.Unmarshal(body, &n2), checker.IsNil)
+	n2, err = cli.NetworkCreate(context.Background(), name, options)
+	c.Assert(err, checker.IsNil)
 
 	// Full ID always works
 	out, err = d.Cmd("network", "inspect", "--format", "{{.ID}}", n1.ID)
@@ -1762,5 +1744,319 @@ func (s *DockerSwarmSuite) TestNetworkInspectWithDuplicateNames(c *check.C) {
 	// Name with duplicates
 	out, err = d.Cmd("network", "inspect", "--format", "{{.ID}}", name)
 	c.Assert(err, checker.NotNil, check.Commentf(out))
-	c.Assert(out, checker.Contains, "network foo is ambiguous (2 matches found based on name)")
+	c.Assert(out, checker.Contains, "2 matches found based on name")
+}
+
+func (s *DockerSwarmSuite) TestSwarmStopSignal(c *check.C) {
+	testRequires(c, DaemonIsLinux, UserNamespaceROMount)
+
+	d := s.AddDaemon(c, true, true)
+
+	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", "top", "--stop-signal=SIGHUP", "busybox", "top")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	// make sure task has been deployed.
+	waitAndAssert(c, defaultReconciliationTimeout, d.CheckActiveContainerCount, checker.Equals, 1)
+
+	out, err = d.Cmd("service", "inspect", "--format", "{{ .Spec.TaskTemplate.ContainerSpec.StopSignal }}", "top")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	c.Assert(strings.TrimSpace(out), checker.Equals, "SIGHUP")
+
+	containers := d.ActiveContainers(c)
+	out, err = d.Cmd("inspect", "--type", "container", "--format", "{{.Config.StopSignal}}", containers[0])
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	c.Assert(strings.TrimSpace(out), checker.Equals, "SIGHUP")
+
+	out, err = d.Cmd("service", "update", "--detach", "--stop-signal=SIGUSR1", "top")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	out, err = d.Cmd("service", "inspect", "--format", "{{ .Spec.TaskTemplate.ContainerSpec.StopSignal }}", "top")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	c.Assert(strings.TrimSpace(out), checker.Equals, "SIGUSR1")
+}
+
+func (s *DockerSwarmSuite) TestSwarmServiceLsFilterMode(c *check.C) {
+	d := s.AddDaemon(c, true, true)
+
+	out, err := d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", "top1", "busybox", "top")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
+
+	out, err = d.Cmd("service", "create", "--detach", "--no-resolve-image", "--name", "top2", "--mode=global", "busybox", "top")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
+
+	// make sure task has been deployed.
+	waitAndAssert(c, defaultReconciliationTimeout, d.CheckActiveContainerCount, checker.Equals, 2)
+
+	out, err = d.Cmd("service", "ls")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	c.Assert(out, checker.Contains, "top1")
+	c.Assert(out, checker.Contains, "top2")
+	c.Assert(out, checker.Not(checker.Contains), "localnet")
+
+	out, err = d.Cmd("service", "ls", "--filter", "mode=global")
+	c.Assert(out, checker.Not(checker.Contains), "top1")
+	c.Assert(out, checker.Contains, "top2")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	out, err = d.Cmd("service", "ls", "--filter", "mode=replicated")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	c.Assert(out, checker.Contains, "top1")
+	c.Assert(out, checker.Not(checker.Contains), "top2")
+}
+
+func (s *DockerSwarmSuite) TestSwarmInitUnspecifiedDataPathAddr(c *check.C) {
+	d := s.AddDaemon(c, false, false)
+
+	out, err := d.Cmd("swarm", "init", "--data-path-addr", "0.0.0.0")
+	c.Assert(err, checker.NotNil)
+	c.Assert(out, checker.Contains, "data path address must be a non-zero IP")
+
+	out, err = d.Cmd("swarm", "init", "--data-path-addr", "0.0.0.0:2000")
+	c.Assert(err, checker.NotNil)
+	c.Assert(out, checker.Contains, "data path address must be a non-zero IP")
+}
+
+func (s *DockerSwarmSuite) TestSwarmJoinLeave(c *check.C) {
+	d := s.AddDaemon(c, true, true)
+
+	out, err := d.Cmd("swarm", "join-token", "-q", "worker")
+	c.Assert(err, checker.IsNil)
+	c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
+
+	token := strings.TrimSpace(out)
+
+	// Verify that back to back join/leave does not cause panics
+	d1 := s.AddDaemon(c, false, false)
+	for i := 0; i < 10; i++ {
+		out, err = d1.Cmd("swarm", "join", "--token", token, d.SwarmListenAddr())
+		c.Assert(err, checker.IsNil)
+		c.Assert(strings.TrimSpace(out), checker.Not(checker.Equals), "")
+
+		_, err = d1.Cmd("swarm", "leave")
+		c.Assert(err, checker.IsNil)
+	}
+}
+
+const defaultRetryCount = 10
+
+func waitForEvent(c *check.C, d *daemon.Daemon, since string, filter string, event string, retry int) string {
+	if retry < 1 {
+		c.Fatalf("retry count %d is invalid. It should be no less than 1", retry)
+		return ""
+	}
+	var out string
+	for i := 0; i < retry; i++ {
+		until := daemonUnixTime(c)
+		var err error
+		if len(filter) > 0 {
+			out, err = d.Cmd("events", "--since", since, "--until", until, filter)
+		} else {
+			out, err = d.Cmd("events", "--since", since, "--until", until)
+		}
+		c.Assert(err, checker.IsNil, check.Commentf(out))
+		if strings.Contains(out, event) {
+			return strings.TrimSpace(out)
+		}
+		// no need to sleep after last retry
+		if i < retry-1 {
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	c.Fatalf("docker events output '%s' doesn't contain event '%s'", out, event)
+	return ""
+}
+
+func (s *DockerSwarmSuite) TestSwarmClusterEventsSource(c *check.C) {
+	d1 := s.AddDaemon(c, true, true)
+	d2 := s.AddDaemon(c, true, true)
+	d3 := s.AddDaemon(c, true, false)
+
+	// create a network
+	out, err := d1.Cmd("network", "create", "--attachable", "-d", "overlay", "foo")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	networkID := strings.TrimSpace(out)
+	c.Assert(networkID, checker.Not(checker.Equals), "")
+
+	// d1, d2 are managers that can get swarm events
+	waitForEvent(c, d1, "0", "-f scope=swarm", "network create "+networkID, defaultRetryCount)
+	waitForEvent(c, d2, "0", "-f scope=swarm", "network create "+networkID, defaultRetryCount)
+
+	// d3 is a worker, not able to get cluster events
+	out = waitForEvent(c, d3, "0", "-f scope=swarm", "", 1)
+	c.Assert(out, checker.Not(checker.Contains), "network create ")
+}
+
+func (s *DockerSwarmSuite) TestSwarmClusterEventsScope(c *check.C) {
+	d := s.AddDaemon(c, true, true)
+
+	// create a service
+	out, err := d.Cmd("service", "create", "--no-resolve-image", "--name", "test", "--detach=false", "busybox", "top")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	serviceID := strings.Split(out, "\n")[0]
+
+	// scope swarm filters cluster events
+	out = waitForEvent(c, d, "0", "-f scope=swarm", "service create "+serviceID, defaultRetryCount)
+	c.Assert(out, checker.Not(checker.Contains), "container create ")
+
+	// all events are returned if scope is not specified
+	waitForEvent(c, d, "0", "", "service create "+serviceID, 1)
+	waitForEvent(c, d, "0", "", "container create ", defaultRetryCount)
+
+	// scope local only shows non-cluster events
+	out = waitForEvent(c, d, "0", "-f scope=local", "container create ", 1)
+	c.Assert(out, checker.Not(checker.Contains), "service create ")
+}
+
+func (s *DockerSwarmSuite) TestSwarmClusterEventsType(c *check.C) {
+	d := s.AddDaemon(c, true, true)
+
+	// create a service
+	out, err := d.Cmd("service", "create", "--no-resolve-image", "--name", "test", "--detach=false", "busybox", "top")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	serviceID := strings.Split(out, "\n")[0]
+
+	// create a network
+	out, err = d.Cmd("network", "create", "--attachable", "-d", "overlay", "foo")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	networkID := strings.TrimSpace(out)
+	c.Assert(networkID, checker.Not(checker.Equals), "")
+
+	// filter by service
+	out = waitForEvent(c, d, "0", "-f type=service", "service create "+serviceID, defaultRetryCount)
+	c.Assert(out, checker.Not(checker.Contains), "network create")
+
+	// filter by network
+	out = waitForEvent(c, d, "0", "-f type=network", "network create "+networkID, defaultRetryCount)
+	c.Assert(out, checker.Not(checker.Contains), "service create")
+}
+
+func (s *DockerSwarmSuite) TestSwarmClusterEventsService(c *check.C) {
+	d := s.AddDaemon(c, true, true)
+
+	// create a service
+	out, err := d.Cmd("service", "create", "--no-resolve-image", "--name", "test", "--detach=false", "busybox", "top")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	serviceID := strings.Split(out, "\n")[0]
+
+	// validate service create event
+	waitForEvent(c, d, "0", "-f scope=swarm", "service create "+serviceID, defaultRetryCount)
+
+	t1 := daemonUnixTime(c)
+	out, err = d.Cmd("service", "update", "--force", "--detach=false", "test")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	// wait for service update start
+	out = waitForEvent(c, d, t1, "-f scope=swarm", "service update "+serviceID, defaultRetryCount)
+	c.Assert(out, checker.Contains, "updatestate.new=updating")
+
+	// allow service update complete. This is a service with 1 instance
+	time.Sleep(400 * time.Millisecond)
+	out = waitForEvent(c, d, t1, "-f scope=swarm", "service update "+serviceID, defaultRetryCount)
+	c.Assert(out, checker.Contains, "updatestate.new=completed, updatestate.old=updating")
+
+	// scale service
+	t2 := daemonUnixTime(c)
+	out, err = d.Cmd("service", "scale", "test=3")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	out = waitForEvent(c, d, t2, "-f scope=swarm", "service update "+serviceID, defaultRetryCount)
+	c.Assert(out, checker.Contains, "replicas.new=3, replicas.old=1")
+
+	// remove service
+	t3 := daemonUnixTime(c)
+	out, err = d.Cmd("service", "rm", "test")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	waitForEvent(c, d, t3, "-f scope=swarm", "service remove "+serviceID, defaultRetryCount)
+}
+
+func (s *DockerSwarmSuite) TestSwarmClusterEventsNode(c *check.C) {
+	d1 := s.AddDaemon(c, true, true)
+	s.AddDaemon(c, true, true)
+	d3 := s.AddDaemon(c, true, true)
+
+	d3ID := d3.NodeID()
+	waitForEvent(c, d1, "0", "-f scope=swarm", "node create "+d3ID, defaultRetryCount)
+
+	t1 := daemonUnixTime(c)
+	out, err := d1.Cmd("node", "update", "--availability=pause", d3ID)
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	// filter by type
+	out = waitForEvent(c, d1, t1, "-f type=node", "node update "+d3ID, defaultRetryCount)
+	c.Assert(out, checker.Contains, "availability.new=pause, availability.old=active")
+
+	t2 := daemonUnixTime(c)
+	out, err = d1.Cmd("node", "demote", d3ID)
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	waitForEvent(c, d1, t2, "-f type=node", "node update "+d3ID, defaultRetryCount)
+
+	t3 := daemonUnixTime(c)
+	out, err = d1.Cmd("node", "rm", "-f", d3ID)
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	// filter by scope
+	waitForEvent(c, d1, t3, "-f scope=swarm", "node remove "+d3ID, defaultRetryCount)
+}
+
+func (s *DockerSwarmSuite) TestSwarmClusterEventsNetwork(c *check.C) {
+	d := s.AddDaemon(c, true, true)
+
+	// create a network
+	out, err := d.Cmd("network", "create", "--attachable", "-d", "overlay", "foo")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+	networkID := strings.TrimSpace(out)
+
+	waitForEvent(c, d, "0", "-f scope=swarm", "network create "+networkID, defaultRetryCount)
+
+	// remove network
+	t1 := daemonUnixTime(c)
+	out, err = d.Cmd("network", "rm", "foo")
+	c.Assert(err, checker.IsNil, check.Commentf(out))
+
+	// filtered by network
+	waitForEvent(c, d, t1, "-f type=network", "network remove "+networkID, defaultRetryCount)
+}
+
+func (s *DockerSwarmSuite) TestSwarmClusterEventsSecret(c *check.C) {
+	d := s.AddDaemon(c, true, true)
+
+	testName := "test_secret"
+	id := d.CreateSecret(c, swarm.SecretSpec{
+		Annotations: swarm.Annotations{
+			Name: testName,
+		},
+		Data: []byte("TESTINGDATA"),
+	})
+	c.Assert(id, checker.Not(checker.Equals), "", check.Commentf("secrets: %s", id))
+
+	waitForEvent(c, d, "0", "-f scope=swarm", "secret create "+id, defaultRetryCount)
+
+	t1 := daemonUnixTime(c)
+	d.DeleteSecret(c, id)
+	// filtered by secret
+	waitForEvent(c, d, t1, "-f type=secret", "secret remove "+id, defaultRetryCount)
+}
+
+func (s *DockerSwarmSuite) TestSwarmClusterEventsConfig(c *check.C) {
+	d := s.AddDaemon(c, true, true)
+
+	testName := "test_config"
+	id := d.CreateConfig(c, swarm.ConfigSpec{
+		Annotations: swarm.Annotations{
+			Name: testName,
+		},
+		Data: []byte("TESTINGDATA"),
+	})
+	c.Assert(id, checker.Not(checker.Equals), "", check.Commentf("configs: %s", id))
+
+	waitForEvent(c, d, "0", "-f scope=swarm", "config create "+id, defaultRetryCount)
+
+	t1 := daemonUnixTime(c)
+	d.DeleteConfig(c, id)
+	// filtered by config
+	waitForEvent(c, d, t1, "-f type=config", "config remove "+id, defaultRetryCount)
 }

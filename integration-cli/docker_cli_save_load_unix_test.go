@@ -12,9 +12,10 @@ import (
 	"time"
 
 	"github.com/docker/docker/integration-cli/checker"
-	icmd "github.com/docker/docker/pkg/testutil/cmd"
+	"github.com/docker/docker/integration-cli/cli/build"
 	"github.com/go-check/check"
 	"github.com/kr/pty"
+	"gotest.tools/icmd"
 )
 
 // save a repo and try to load it using stdout
@@ -66,12 +67,12 @@ func (s *DockerSuite) TestSaveAndLoadRepoStdout(c *check.C) {
 
 	n, err := pty.Read(buf)
 	c.Assert(err, check.IsNil) //could not read tty output
-	c.Assert(string(buf[:n]), checker.Contains, "Cowardly refusing", check.Commentf("help output is not being yielded"))
+	c.Assert(string(buf[:n]), checker.Contains, "cowardly refusing", check.Commentf("help output is not being yielded"))
 }
 
 func (s *DockerSuite) TestSaveAndLoadWithProgressBar(c *check.C) {
 	name := "test-load"
-	buildImageSuccessfully(c, name, withDockerfile(`FROM busybox
+	buildImageSuccessfully(c, name, build.WithDockerfile(`FROM busybox
 	RUN touch aa
 	`))
 

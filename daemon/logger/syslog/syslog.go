@@ -1,5 +1,5 @@
 // Package syslog provides the logdriver for forwarding server logs to syslog endpoints.
-package syslog
+package syslog // import "github.com/docker/docker/daemon/logger/syslog"
 
 import (
 	"crypto/tls"
@@ -14,11 +14,11 @@ import (
 
 	syslog "github.com/RackSec/srslog"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/docker/daemon/logger/loggerutils"
 	"github.com/docker/docker/pkg/urlutil"
 	"github.com/docker/go-connections/tlsconfig"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -74,7 +74,7 @@ func rfc5424formatterWithAppNameAsTag(p syslog.Priority, hostname, tag, content 
 }
 
 // The timestamp field in rfc5424 is derived from rfc3339. Whereas rfc3339 makes allowances
-// for multiple syntaxes, there are further restrictions in rfc5424, i.e., the maximium
+// for multiple syntaxes, there are further restrictions in rfc5424, i.e., the maximum
 // resolution is limited to "TIME-SECFRAC" which is 6 (microsecond resolution)
 func rfc5424microformatterWithAppNameAsTag(p syslog.Priority, hostname, tag, content string) string {
 	timestamp := time.Now().Format("2006-01-02T15:04:05.999999Z07:00")
@@ -133,8 +133,9 @@ func New(info logger.Info) (logger.Logger, error) {
 
 func (s *syslogger) Log(msg *logger.Message) error {
 	line := string(msg.Line)
+	source := msg.Source
 	logger.PutMessage(msg)
-	if msg.Source == "stderr" {
+	if source == "stderr" {
 		return s.writer.Err(line)
 	}
 	return s.writer.Info(line)
@@ -186,6 +187,7 @@ func ValidateLogOpt(cfg map[string]string) error {
 	for key := range cfg {
 		switch key {
 		case "env":
+		case "env-regex":
 		case "labels":
 		case "syslog-address":
 		case "syslog-facility":

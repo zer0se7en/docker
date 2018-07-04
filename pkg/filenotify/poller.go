@@ -1,4 +1,4 @@
-package filenotify
+package filenotify // import "github.com/docker/docker/pkg/filenotify"
 
 import (
 	"errors"
@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 
 	"github.com/fsnotify/fsnotify"
 )
@@ -44,7 +44,7 @@ func (w *filePoller) Add(name string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.closed == true {
+	if w.closed {
 		return errPollerClosed
 	}
 
@@ -78,7 +78,7 @@ func (w *filePoller) Remove(name string) error {
 }
 
 func (w *filePoller) remove(name string) error {
-	if w.closed == true {
+	if w.closed {
 		return errPollerClosed
 	}
 

@@ -14,9 +14,10 @@ import (
 	"github.com/docker/distribution/manifest/manifestlist"
 	"github.com/docker/distribution/manifest/schema2"
 	"github.com/docker/docker/integration-cli/checker"
-	icmd "github.com/docker/docker/pkg/testutil/cmd"
+	"github.com/docker/docker/integration-cli/cli/build"
 	"github.com/go-check/check"
 	"github.com/opencontainers/go-digest"
+	"gotest.tools/icmd"
 )
 
 // testPullImageWithAliases pulls a specific image tag and verifies that any aliases (i.e., other
@@ -26,7 +27,7 @@ import (
 func testPullImageWithAliases(c *check.C) {
 	repoName := fmt.Sprintf("%v/dockercli/busybox", privateRegistryURL)
 
-	repos := []string{}
+	var repos []string
 	for _, tag := range []string{"recent", "fresh"} {
 		repos = append(repos, fmt.Sprintf("%v:%v", repoName, tag))
 	}
@@ -62,10 +63,10 @@ func (s *DockerSchema1RegistrySuite) TestPullImageWithAliases(c *check.C) {
 func testConcurrentPullWholeRepo(c *check.C) {
 	repoName := fmt.Sprintf("%v/dockercli/busybox", privateRegistryURL)
 
-	repos := []string{}
+	var repos []string
 	for _, tag := range []string{"recent", "fresh", "todays"} {
 		repo := fmt.Sprintf("%v:%v", repoName, tag)
-		buildImageSuccessfully(c, repo, withDockerfile(fmt.Sprintf(`
+		buildImageSuccessfully(c, repo, build.WithDockerfile(fmt.Sprintf(`
 		    FROM busybox
 		    ENTRYPOINT ["/bin/echo"]
 		    ENV FOO foo
@@ -150,10 +151,10 @@ func (s *DockerSchema1RegistrySuite) testConcurrentFailingPull(c *check.C) {
 func testConcurrentPullMultipleTags(c *check.C) {
 	repoName := fmt.Sprintf("%v/dockercli/busybox", privateRegistryURL)
 
-	repos := []string{}
+	var repos []string
 	for _, tag := range []string{"recent", "fresh", "todays"} {
 		repo := fmt.Sprintf("%v:%v", repoName, tag)
-		buildImageSuccessfully(c, repo, withDockerfile(fmt.Sprintf(`
+		buildImageSuccessfully(c, repo, build.WithDockerfile(fmt.Sprintf(`
 		    FROM busybox
 		    ENTRYPOINT ["/bin/echo"]
 		    ENV FOO foo
@@ -207,7 +208,7 @@ func testPullIDStability(c *check.C) {
 	derivedImage := privateRegistryURL + "/dockercli/id-stability"
 	baseImage := "busybox"
 
-	buildImageSuccessfully(c, derivedImage, withDockerfile(fmt.Sprintf(`
+	buildImageSuccessfully(c, derivedImage, build.WithDockerfile(fmt.Sprintf(`
 	    FROM %s
 	    ENV derived true
 	    ENV asdf true
@@ -266,7 +267,7 @@ func (s *DockerSchema1RegistrySuite) TestPullIDStability(c *check.C) {
 func testPullNoLayers(c *check.C) {
 	repoName := fmt.Sprintf("%v/dockercli/scratch", privateRegistryURL)
 
-	buildImageSuccessfully(c, repoName, withDockerfile(`
+	buildImageSuccessfully(c, repoName, build.WithDockerfile(`
 	FROM scratch
 	ENV foo bar`))
 	dockerCmd(c, "push", repoName)

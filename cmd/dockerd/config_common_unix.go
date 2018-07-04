@@ -1,4 +1,4 @@
-// +build solaris linux freebsd
+// +build linux freebsd
 
 package main
 
@@ -11,7 +11,7 @@ import (
 
 var (
 	defaultPidFile  = "/var/run/docker.pid"
-	defaultGraph    = "/var/lib/docker"
+	defaultDataRoot = "/var/lib/docker"
 	defaultExecRoot = "/var/run/docker"
 )
 
