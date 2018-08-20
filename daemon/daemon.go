@@ -18,6 +18,11 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc"
+
+	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/defaults"
+	"github.com/containerd/containerd/pkg/dialer"
 	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/swarm"
@@ -87,13 +92,14 @@ type Daemon struct {
 	seccompEnabled    bool
 	apparmorEnabled   bool
 	shutdown          bool
-	idMappings        *idtools.IDMappings
+	idMapping         *idtools.IdentityMapping
 	// TODO: move graphDrivers field to an InfoService
 	graphDrivers map[string]string // By operating system
 
 	PluginStore           *plugin.Store // todo: remove
 	pluginManager         *plugin.Manager
 	linkIndex             *linkIndex
+	containerdCli         *containerd.Client
 	containerd            libcontainerd.Client
 	defaultIsolation      containertypes.Isolation // Default isolation mode on Windows
 	clusterProvider       cluster.Provider
@@ -538,7 +544,7 @@ func (daemon *Daemon) DaemonLeavesCluster() {
 		select {
 		case <-done:
 		case <-time.After(5 * time.Second):
-			logrus.Warnf("timeout while waiting for ingress network removal")
+			logrus.Warn("timeout while waiting for ingress network removal")
 		}
 	} else {
 		logrus.Warnf("failed to initiate ingress network removal: %v", err)
@@ -565,8 +571,13 @@ func (daemon *Daemon) IsSwarmCompatible() error {
 
 // NewDaemon sets up everything for the daemon to be able to service
 // requests from the webserver.
-func NewDaemon(config *config.Config, registryService registry.Service, containerdRemote libcontainerd.Remote, pluginStore *plugin.Store) (daemon *Daemon, err error) {
+func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.Store) (daemon *Daemon, err error) {
 	setDefaultMtu(config)
+
+	registryService, err := registry.NewService(config.ServiceOptions)
+	if err != nil {
+		return nil, err
+	}
 
 	// Ensure that we have a correct root key limit for launching containers.
 	if err := ModifyRootKeyLimit(); err != nil {
@@ -581,6 +592,9 @@ func NewDaemon(config *config.Config, registryService registry.Service, containe
 	// Do we have a disabled network?
 	config.DisableBridge = isBridgeNetworkDisabled(config)
 
+	// Setup the resolv.conf
+	setupResolvConf(config)
+
 	// Verify the platform is supported as a daemon
 	if !platformSupported {
 		return nil, errSystemNotSupported
@@ -591,11 +605,11 @@ func NewDaemon(config *config.Config, registryService registry.Service, containe
 		return nil, err
 	}
 
-	idMappings, err := setupRemappedRoot(config)
+	idMapping, err := setupRemappedRoot(config)
 	if err != nil {
 		return nil, err
 	}
-	rootIDs := idMappings.RootPair()
+	rootIDs := idMapping.RootPair()
 	if err := setupDaemonProcess(config); err != nil {
 		return nil, err
 	}
@@ -717,8 +731,35 @@ func NewDaemon(config *config.Config, registryService registry.Service, containe
 	}
 	registerMetricsPluginCallback(d.PluginStore, metricsSockPath)
 
+	gopts := []grpc.DialOption{
+		grpc.WithInsecure(),
+		grpc.WithBackoffMaxDelay(3 * time.Second),
+		grpc.WithDialer(dialer.Dialer),
+
+		// TODO(stevvooe): We may need to allow configuration of this on the client.
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize)),
+		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)),
+	}
+	if config.ContainerdAddr != "" {
+		d.containerdCli, err = containerd.New(config.ContainerdAddr, containerd.WithDefaultNamespace(ContainersNamespace), containerd.WithDialOpts(gopts))
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to dial %q", config.ContainerdAddr)
+		}
+	}
+
 	createPluginExec := func(m *plugin.Manager) (plugin.Executor, error) {
-		return pluginexec.New(getPluginExecRoot(config.Root), containerdRemote, m)
+		var pluginCli *containerd.Client
+
+		// Windows is not currently using containerd, keep the
+		// client as nil
+		if config.ContainerdAddr != "" {
+			pluginCli, err = containerd.New(config.ContainerdAddr, containerd.WithDefaultNamespace(pluginexec.PluginNamespace), containerd.WithDialOpts(gopts))
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to dial %q", config.ContainerdAddr)
+			}
+		}
+
+		return pluginexec.New(ctx, getPluginExecRoot(config.Root), pluginCli, m)
 	}
 
 	// Plugin system initialization should happen before restore. Do not change order.
@@ -746,7 +787,7 @@ func NewDaemon(config *config.Config, registryService registry.Service, containe
 			MetadataStorePathTemplate: filepath.Join(config.Root, "image", "%s", "layerdb"),
 			GraphDriver:               gd,
 			GraphDriverOptions:        config.GraphOptions,
-			IDMappings:                idMappings,
+			IDMapping:                 idMapping,
 			PluginGetter:              d.PluginStore,
 			ExperimentalEnabled:       config.Experimental,
 			OS:                        operatingSystem,
@@ -853,7 +894,7 @@ func NewDaemon(config *config.Config, registryService registry.Service, containe
 
 	d.EventsService = events.New()
 	d.root = config.Root
-	d.idMappings = idMappings
+	d.idMapping = idMapping
 	d.seccompEnabled = sysInfo.Seccomp
 	d.apparmorEnabled = sysInfo.AppArmor
 
@@ -877,7 +918,7 @@ func NewDaemon(config *config.Config, registryService registry.Service, containe
 
 	go d.execCommandGC()
 
-	d.containerd, err = containerdRemote.NewClient(ContainersNamespace, d)
+	d.containerd, err = libcontainerd.NewClient(ctx, d.containerdCli, filepath.Join(config.ExecRoot, "containerd"), ContainersNamespace, d)
 	if err != nil {
 		return nil, err
 	}
@@ -1034,6 +1075,10 @@ func (daemon *Daemon) Shutdown() error {
 		daemon.netController.Stop()
 	}
 
+	if daemon.containerdCli != nil {
+		daemon.containerdCli.Close()
+	}
+
 	return daemon.cleanupMounts()
 }
 
@@ -1103,7 +1148,7 @@ func (daemon *Daemon) Subnets() ([]net.IPNet, []net.IPNet) {
 // prepareTempDir prepares and returns the default directory to use
 // for temporary files.
 // If it doesn't exist, it is created. If it exists, its content is removed.
-func prepareTempDir(rootDir string, rootIDs idtools.IDPair) (string, error) {
+func prepareTempDir(rootDir string, rootIdentity idtools.Identity) (string, error) {
 	var tmpDir string
 	if tmpDir = os.Getenv("DOCKER_TMPDIR"); tmpDir == "" {
 		tmpDir = filepath.Join(rootDir, "tmp")
@@ -1123,7 +1168,7 @@ func prepareTempDir(rootDir string, rootIDs idtools.IDPair) (string, error) {
 	}
 	// We don't remove the content of tmpdir if it's not the default,
 	// it may hold things that do not belong to us.
-	return tmpDir, idtools.MkdirAllAndChown(tmpDir, 0700, rootIDs)
+	return tmpDir, idtools.MkdirAllAndChown(tmpDir, 0700, rootIdentity)
 }
 
 func (daemon *Daemon) setGenericResources(conf *config.Config) error {
@@ -1271,11 +1316,11 @@ func CreateDaemonRoot(config *config.Config) error {
 		}
 	}
 
-	idMappings, err := setupRemappedRoot(config)
+	idMapping, err := setupRemappedRoot(config)
 	if err != nil {
 		return err
 	}
-	return setupDaemonRoot(config, realRoot, idMappings.RootPair())
+	return setupDaemonRoot(config, realRoot, idMapping.RootPair())
 }
 
 // checkpointAndSave grabs a container lock to safely call container.CheckpointTo
@@ -1301,9 +1346,9 @@ func (daemon *Daemon) GetAttachmentStore() *network.AttachmentStore {
 	return &daemon.attachmentStore
 }
 
-// IDMappings returns uid/gid mappings for the builder
-func (daemon *Daemon) IDMappings() *idtools.IDMappings {
-	return daemon.idMappings
+// IdentityMapping returns uid/gid mapping or a SID (in the case of Windows) for the builder
+func (daemon *Daemon) IdentityMapping() *idtools.IdentityMapping {
+	return daemon.idMapping
 }
 
 // ImageService returns the Daemon's ImageService

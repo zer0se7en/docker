@@ -13,6 +13,15 @@ keywords: "API, Docker, rcli, REST, documentation"
      will be rejected.
 -->
 
+## V1.39 API changes
+
+[Docker Engine API v1.39](https://docs.docker.com/engine/api/v1.39/) documentation
+
+* `GET /info` now returns an empty string, instead of `<unknown>` for `KernelVersion`
+  and `OperatingSystem` if the daemon was unable to obtain this information.
+* `GET /info` now returns information about the product license, if a license
+  has been applied to the daemon.
+
 ## V1.38 API changes
 
 [Docker Engine API v1.38](https://docs.docker.com/engine/api/v1.38/) documentation

@@ -83,6 +83,8 @@ type sandbox struct {
 	inDelete           bool
 	ingress            bool
 	ndotsSet           bool
+	oslTypes           []osl.SandboxType // slice of properties of this sandbox
+	loadBalancerNID    string            // NID that this SB is a load balancer for
 	sync.Mutex
 	// This mutex is used to serialize service related operation for an endpoint
 	// The lock is here because the endpoint is saved into the store so is not unique
@@ -466,7 +468,7 @@ func (sb *sandbox) ResolveService(name string) ([]*net.SRV, []net.IP) {
 
 	logrus.Debugf("Service name To resolve: %v", name)
 
-	// There are DNS implementaions that allow SRV queries for names not in
+	// There are DNS implementations that allow SRV queries for names not in
 	// the format defined by RFC 2782. Hence specific validations checks are
 	// not done
 	parts := strings.Split(name, ".")
@@ -740,14 +742,7 @@ func releaseOSSboxResources(osSbox osl.Sandbox, ep *endpoint) {
 
 	ep.Lock()
 	joinInfo := ep.joinInfo
-	vip := ep.virtualIP
 	ep.Unlock()
-
-	if len(vip) != 0 {
-		if err := osSbox.RemoveLoopbackAliasIP(&net.IPNet{IP: vip, Mask: net.CIDRMask(32, 32)}); err != nil {
-			logrus.Warnf("Remove virtual IP %v failed: %v", vip, err)
-		}
-	}
 
 	if joinInfo == nil {
 		return
@@ -861,13 +856,6 @@ func (sb *sandbox) populateNetworkResources(ep *endpoint) error {
 		}
 	}
 
-	if len(ep.virtualIP) != 0 {
-		err := sb.osSbox.AddLoopbackAliasIP(&net.IPNet{IP: ep.virtualIP, Mask: net.CIDRMask(32, 32)})
-		if err != nil {
-			return fmt.Errorf("failed to add virtual IP %v: %v", ep.virtualIP, err)
-		}
-	}
-
 	if joinInfo != nil {
 		// Set up non-interface routes.
 		for _, r := range joinInfo.StaticRoutes {
@@ -893,7 +881,7 @@ func (sb *sandbox) populateNetworkResources(ep *endpoint) error {
 	// information including gateway and other routes so that
 	// loadbalancers are populated all the network state is in
 	// place in the sandbox.
-	sb.populateLoadbalancers(ep)
+	sb.populateLoadBalancers(ep)
 
 	// Only update the store if we did not come here as part of
 	// sandbox delete. If we came here as part of delete then do
@@ -1111,8 +1099,8 @@ func OptionDNSOptions(options string) SandboxOption {
 	}
 }
 
-// OptionUseDefaultSandbox function returns an option setter for using default sandbox to
-// be passed to container Create method.
+// OptionUseDefaultSandbox function returns an option setter for using default sandbox
+// (host namespace) to be passed to container Create method.
 func OptionUseDefaultSandbox() SandboxOption {
 	return func(sb *sandbox) {
 		sb.config.useDefaultSandBox = true
@@ -1176,6 +1164,16 @@ func OptionPortMapping(portBindings []types.PortBinding) SandboxOption {
 func OptionIngress() SandboxOption {
 	return func(sb *sandbox) {
 		sb.ingress = true
+		sb.oslTypes = append(sb.oslTypes, osl.SandboxTypeIngress)
+	}
+}
+
+// OptionLoadBalancer function returns an option setter for marking a
+// sandbox as a load balancer sandbox.
+func OptionLoadBalancer(nid string) SandboxOption {
+	return func(sb *sandbox) {
+		sb.loadBalancerNID = nid
+		sb.oslTypes = append(sb.oslTypes, osl.SandboxTypeLoadBalancer)
 	}
 }
 

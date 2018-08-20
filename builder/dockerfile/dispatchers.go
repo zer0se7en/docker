@@ -274,11 +274,17 @@ func (d *dispatchRequest) getImageOrStage(name string, platform *specs.Platform)
 	}
 	return imageMount.Image(), nil
 }
-func (d *dispatchRequest) getFromImage(shlex *shell.Lex, name string, platform *specs.Platform) (builder.Image, error) {
-	name, err := d.getExpandedString(shlex, name)
+func (d *dispatchRequest) getFromImage(shlex *shell.Lex, basename string, platform *specs.Platform) (builder.Image, error) {
+	name, err := d.getExpandedString(shlex, basename)
 	if err != nil {
 		return nil, err
 	}
+	// Empty string is interpreted to FROM scratch by images.GetImageAndReleasableLayer,
+	// so validate expanded result is not empty.
+	if name == "" {
+		return nil, errors.Errorf("base name (%s) should not be blank", basename)
+	}
+
 	return d.getImageOrStage(name, platform)
 }
 
@@ -365,7 +371,8 @@ func dispatchRun(d dispatchRequest, c *instructions.RunCommand) error {
 	runConfig := copyRunConfig(stateRunConfig,
 		withCmd(cmdFromArgs),
 		withEnv(append(stateRunConfig.Env, buildArgs...)),
-		withEntrypointOverride(saveCmd, strslice.StrSlice{""}))
+		withEntrypointOverride(saveCmd, strslice.StrSlice{""}),
+		withoutHealthcheck())
 
 	// set config as already being escaped, this prevents double escaping on windows
 	runConfig.ArgsEscaped = true

@@ -53,7 +53,7 @@ func parseSecurityOpt(container *container.Container, config *containertypes.Hos
 	return nil
 }
 
-func setupInitLayer(idMappings *idtools.IDMappings) func(containerfs.ContainerFS) error {
+func setupInitLayer(idMapping *idtools.IdentityMapping) func(containerfs.ContainerFS) error {
 	return nil
 }
 
@@ -465,11 +465,11 @@ func (daemon *Daemon) cleanupMounts() error {
 	return nil
 }
 
-func setupRemappedRoot(config *config.Config) (*idtools.IDMappings, error) {
-	return &idtools.IDMappings{}, nil
+func setupRemappedRoot(config *config.Config) (*idtools.IdentityMapping, error) {
+	return &idtools.IdentityMapping{}, nil
 }
 
-func setupDaemonRoot(config *config.Config, rootDir string, rootIDs idtools.IDPair) error {
+func setupDaemonRoot(config *config.Config, rootDir string, rootIdentity idtools.Identity) error {
 	config.Root = rootDir
 	// Create the root directory if it doesn't exists
 	if err := system.MkdirAllWithACL(config.Root, 0, system.SddlAdministratorsLocalSystem); err != nil {
@@ -652,4 +652,7 @@ func (daemon *Daemon) loadRuntimes() error {
 
 func (daemon *Daemon) initRuntimes(_ map[string]types.Runtime) error {
 	return nil
+}
+
+func setupResolvConf(config *config.Config) {
 }

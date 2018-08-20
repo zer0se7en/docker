@@ -121,7 +121,7 @@ type NetworkController interface {
 	// Stop network controller
 	Stop()
 
-	// ReloadCondfiguration updates the controller configuration
+	// ReloadConfiguration updates the controller configuration
 	ReloadConfiguration(cfgOptions ...config.Option) error
 
 	// SetClusterProvider sets cluster provider
@@ -871,7 +871,7 @@ addToStore:
 		}
 	}()
 
-	if len(network.loadBalancerIP) != 0 {
+	if network.hasLoadBalancerEndpoint() {
 		if err = network.createLoadBalancerSandbox(); err != nil {
 			return nil, err
 		}
@@ -1107,6 +1107,8 @@ func (c *controller) NewSandbox(containerID string, options ...SandboxOption) (S
 		sb.config.hostsPath = filepath.Join(c.cfg.Daemon.DataDir, "/network/files/hosts")
 		sb.config.resolvConfPath = filepath.Join(c.cfg.Daemon.DataDir, "/network/files/resolv.conf")
 		sb.id = "ingress_sbox"
+	} else if sb.loadBalancerNID != "" {
+		sb.id = "lb_" + sb.loadBalancerNID
 	}
 	c.Unlock()
 
@@ -1142,6 +1144,11 @@ func (c *controller) NewSandbox(containerID string, options ...SandboxOption) (S
 		if sb.osSbox, err = osl.NewSandbox(sb.Key(), !sb.config.useDefaultSandBox, false); err != nil {
 			return nil, fmt.Errorf("failed to create new osl sandbox: %v", err)
 		}
+	}
+
+	if sb.osSbox != nil {
+		// Apply operating specific knobs on the load balancer sandbox
+		sb.osSbox.ApplyOSTweaks(sb.oslTypes)
 	}
 
 	c.Lock()

@@ -209,6 +209,12 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		frontendAttrs["no-cache"] = ""
 	}
 
+	if opt.Options.PullParent {
+		frontendAttrs["image-resolve-mode"] = "pull"
+	} else {
+		frontendAttrs["image-resolve-mode"] = "default"
+	}
+
 	if opt.Options.Platform != "" {
 		// same as in newBuilder in builder/dockerfile.builder.go
 		// TODO: remove once opt.Options.Platform is of type specs.Platform
@@ -237,7 +243,7 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 		Session:       opt.Options.SessionID,
 	}
 
-	aux := streamformatter.AuxFormatter{opt.ProgressWriter.Output}
+	aux := streamformatter.AuxFormatter{Writer: opt.ProgressWriter.Output}
 
 	eg, ctx := errgroup.WithContext(ctx)
 
@@ -258,9 +264,10 @@ func (b *Builder) Build(ctx context.Context, opt backend.BuildConfig) (*builder.
 
 	eg.Go(func() error {
 		defer close(ch)
-		return b.controller.Status(&controlapi.StatusRequest{
-			Ref: id,
-		}, &statusProxy{streamProxy: streamProxy{ctx: ctx}, ch: ch})
+		// streamProxy.ctx is not set to ctx because when request is cancelled,
+		// only the build request has to be cancelled, not the status request.
+		stream := &statusProxy{streamProxy: streamProxy{ctx: context.TODO()}, ch: ch}
+		return b.controller.Status(&controlapi.StatusRequest{Ref: id}, stream)
 	})
 
 	eg.Go(func() error {
