@@ -2,6 +2,7 @@ package cache
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -24,7 +25,6 @@ var (
 
 type ManagerOpt struct {
 	Snapshotter     snapshot.SnapshotterBase
-	GCPolicy        GCPolicy
 	MetadataStore   *metadata.Store
 	PruneRefChecker ExternalRefCheckerFunc
 }
@@ -38,8 +38,7 @@ type Accessor interface {
 
 type Controller interface {
 	DiskUsage(ctx context.Context, info client.DiskUsageInfo) ([]*client.UsageInfo, error)
-	Prune(ctx context.Context, ch chan client.UsageInfo, info client.PruneInfo) error
-	GC(ctx context.Context) error
+	Prune(ctx context.Context, ch chan client.UsageInfo, info ...client.PruneInfo) error
 }
 
 type Manager interface {
@@ -127,17 +126,24 @@ func (cm *cacheManager) get(ctx context.Context, id string, fromSnapshotter bool
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
 
+	triggerUpdate := true
+	for _, o := range opts {
+		if o == NoUpdateLastUsed {
+			triggerUpdate = false
+		}
+	}
+
 	if rec.mutable {
 		if len(rec.refs) != 0 {
 			return nil, errors.Wrapf(ErrLocked, "%s is locked", id)
 		}
 		if rec.equalImmutable != nil {
-			return rec.equalImmutable.ref(), nil
+			return rec.equalImmutable.ref(triggerUpdate), nil
 		}
-		return rec.mref().commit(ctx)
+		return rec.mref(triggerUpdate).commit(ctx)
 	}
 
-	return rec.ref(), nil
+	return rec.ref(triggerUpdate), nil
 }
 
 // getRecord returns record for id. Requires manager lock.
@@ -165,8 +171,8 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, fromSnapshotte
 		rec := &cacheRecord{
 			mu:           &sync.Mutex{},
 			cm:           cm,
-			refs:         make(map[Mountable]struct{}),
-			parent:       mutable.Parent(),
+			refs:         make(map[ref]struct{}),
+			parent:       mutable.parentRef(false),
 			md:           md,
 			equalMutable: &mutableRef{cacheRecord: mutable},
 		}
@@ -182,7 +188,7 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, fromSnapshotte
 
 	var parent ImmutableRef
 	if info.Parent != "" {
-		parent, err = cm.get(ctx, info.Parent, fromSnapshotter, opts...)
+		parent, err = cm.get(ctx, info.Parent, fromSnapshotter, append(opts, NoUpdateLastUsed)...)
 		if err != nil {
 			return nil, err
 		}
@@ -197,7 +203,7 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, fromSnapshotte
 		mu:      &sync.Mutex{},
 		mutable: info.Kind != snapshots.KindCommitted,
 		cm:      cm,
-		refs:    make(map[Mountable]struct{}),
+		refs:    make(map[ref]struct{}),
 		parent:  parent,
 		md:      md,
 	}
@@ -228,7 +234,7 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, opts ...RefOpti
 	var parentID string
 	if s != nil {
 		var err error
-		parent, err = cm.Get(ctx, s.ID())
+		parent, err = cm.Get(ctx, s.ID(), NoUpdateLastUsed)
 		if err != nil {
 			return nil, err
 		}
@@ -251,7 +257,7 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, opts ...RefOpti
 		mu:      &sync.Mutex{},
 		mutable: true,
 		cm:      cm,
-		refs:    make(map[Mountable]struct{}),
+		refs:    make(map[ref]struct{}),
 		parent:  parent,
 		md:      md,
 	}
@@ -268,7 +274,7 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, opts ...RefOpti
 
 	cm.records[id] = rec // TODO: save to db
 
-	return rec.mref(), nil
+	return rec.mref(true), nil
 }
 func (cm *cacheManager) GetMutable(ctx context.Context, id string) (MutableRef, error) {
 	cm.mu.Lock()
@@ -300,13 +306,22 @@ func (cm *cacheManager) GetMutable(ctx context.Context, id string) (MutableRef, 
 		rec.equalImmutable = nil
 	}
 
-	return rec.mref(), nil
+	return rec.mref(true), nil
 }
 
-func (cm *cacheManager) Prune(ctx context.Context, ch chan client.UsageInfo, opt client.PruneInfo) error {
+func (cm *cacheManager) Prune(ctx context.Context, ch chan client.UsageInfo, opts ...client.PruneInfo) error {
 	cm.muPrune.Lock()
 	defer cm.muPrune.Unlock()
 
+	for _, opt := range opts {
+		if err := cm.pruneOnce(ctx, ch, opt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (cm *cacheManager) pruneOnce(ctx context.Context, ch chan client.UsageInfo, opt client.PruneInfo) error {
 	filter, err := filters.ParseAll(opt.Filter...)
 	if err != nil {
 		return err
@@ -321,14 +336,50 @@ func (cm *cacheManager) Prune(ctx context.Context, ch chan client.UsageInfo, opt
 		check = c
 	}
 
-	return cm.prune(ctx, ch, filter, opt.All, check)
+	totalSize := int64(0)
+	if opt.KeepBytes != 0 {
+		du, err := cm.DiskUsage(ctx, client.DiskUsageInfo{})
+		if err != nil {
+			return err
+		}
+		for _, ui := range du {
+			if check != nil {
+				if check.Exists(ui.ID) {
+					continue
+				}
+			}
+			totalSize += ui.Size
+		}
+	}
+
+	return cm.prune(ctx, ch, pruneOpt{
+		filter:       filter,
+		all:          opt.All,
+		checkShared:  check,
+		keepDuration: opt.KeepDuration,
+		keepBytes:    opt.KeepBytes,
+		totalSize:    totalSize,
+	})
 }
 
-func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, filter filters.Filter, all bool, checkShared ExternalRefChecker) error {
-	var toDelete []*cacheRecord
+func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt pruneOpt) error {
+	var toDelete []*deleteRecord
+
+	if opt.keepBytes != 0 && opt.totalSize < opt.keepBytes {
+		return nil
+	}
+
 	cm.mu.Lock()
 
+	gcMode := opt.keepBytes != 0
+	cutOff := time.Now().Add(-opt.keepDuration)
+
+	locked := map[*sync.Mutex]struct{}{}
+
 	for _, cr := range cm.records {
+		if _, ok := locked[cr.mu]; ok {
+			continue
+		}
 		cr.mu.Lock()
 
 		// ignore duplicates that share data
@@ -349,11 +400,11 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, fil
 			}
 
 			shared := false
-			if checkShared != nil {
-				shared = checkShared.Exists(cr.ID())
+			if opt.checkShared != nil {
+				shared = opt.checkShared.Exists(cr.ID())
 			}
 
-			if !all {
+			if !opt.all {
 				if recordType == client.UsageRecordTypeInternal || recordType == client.UsageRecordTypeFrontend || shared {
 					cr.mu.Unlock()
 					continue
@@ -367,21 +418,56 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, fil
 				Shared:     shared,
 			}
 
-			if filter.Match(adaptUsageInfo(c)) {
-				cr.dead = true
+			usageCount, lastUsedAt := getLastUsed(cr.md)
+			c.LastUsedAt = lastUsedAt
+			c.UsageCount = usageCount
 
-				toDelete = append(toDelete, cr)
-
-				// mark metadata as deleted in case we crash before cleanup finished
-				if err := setDeleted(cr.md); err != nil {
+			if opt.keepDuration != 0 {
+				if lastUsedAt != nil && lastUsedAt.After(cutOff) {
 					cr.mu.Unlock()
-					cm.mu.Unlock()
-					return err
+					continue
+				}
+			}
+
+			if opt.filter.Match(adaptUsageInfo(c)) {
+				toDelete = append(toDelete, &deleteRecord{
+					cacheRecord: cr,
+					lastUsedAt:  c.LastUsedAt,
+					usageCount:  c.UsageCount,
+				})
+				if !gcMode {
+					cr.dead = true
+
+					// mark metadata as deleted in case we crash before cleanup finished
+					if err := setDeleted(cr.md); err != nil {
+						cr.mu.Unlock()
+						cm.mu.Unlock()
+						return err
+					}
+				} else {
+					locked[cr.mu] = struct{}{}
+					continue // leave the record locked
 				}
 			}
 		}
-
 		cr.mu.Unlock()
+	}
+
+	if gcMode && len(toDelete) > 0 {
+		sortDeleteRecords(toDelete)
+		var err error
+		for i, cr := range toDelete {
+			// only remove single record at a time
+			if i == 0 {
+				cr.dead = true
+				err = setDeleted(cr.md)
+			}
+			cr.mu.Unlock()
+		}
+		if err != nil {
+			return err
+		}
+		toDelete = toDelete[:1]
 	}
 
 	cm.mu.Unlock()
@@ -410,7 +496,9 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, fil
 		if cr.parent != nil {
 			c.Parent = cr.parent.ID()
 		}
-
+		if c.Size == sizeUnknown && cr.equalImmutable != nil {
+			c.Size = getSize(cr.equalImmutable.md) // benefit from DiskUsage calc
+		}
 		if c.Size == sizeUnknown {
 			cr.mu.Unlock() // all the non-prune modifications already protected by cr.dead
 			s, err := cr.Size(ctx)
@@ -420,6 +508,8 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, fil
 			c.Size = s
 			cr.mu.Lock()
 		}
+
+		opt.totalSize -= c.Size
 
 		if cr.equalImmutable != nil {
 			if err1 := cr.equalImmutable.remove(ctx, false); err == nil {
@@ -443,7 +533,7 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, fil
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
-		return cm.prune(ctx, ch, filter, all, checkShared)
+		return cm.prune(ctx, ch, opt)
 	}
 }
 
@@ -584,7 +674,7 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 		if d.Size == sizeUnknown {
 			func(d *client.UsageInfo) {
 				eg.Go(func() error {
-					ref, err := cm.Get(ctx, d.ID)
+					ref, err := cm.Get(ctx, d.ID, NoUpdateLastUsed)
 					if err != nil {
 						d.Size = 0
 						return nil
@@ -615,7 +705,7 @@ func IsNotFound(err error) bool {
 	return errors.Cause(err) == errNotFound
 }
 
-type RefOption func(withMetadata) error
+type RefOption interface{}
 
 type cachePolicy int
 
@@ -627,6 +717,10 @@ const (
 type withMetadata interface {
 	Metadata() *metadata.StorageItem
 }
+
+type noUpdateLastUsed struct{}
+
+var NoUpdateLastUsed noUpdateLastUsed
 
 func HasCachePolicyRetain(m withMetadata) bool {
 	return getCachePolicy(m.Metadata()) == cachePolicyRetain
@@ -665,8 +759,10 @@ func initializeMetadata(m withMetadata, opts ...RefOption) error {
 	}
 
 	for _, opt := range opts {
-		if err := opt(m); err != nil {
-			return err
+		if fn, ok := opt.(func(withMetadata) error); ok {
+			if err := fn(m); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -703,5 +799,65 @@ func adaptUsageInfo(info *client.UsageInfo) filters.Adaptor {
 		// TODO: add int/datetime/bytes support for more fields
 
 		return "", false
+	})
+}
+
+type pruneOpt struct {
+	filter       filters.Filter
+	all          bool
+	checkShared  ExternalRefChecker
+	keepDuration time.Duration
+	keepBytes    int64
+	totalSize    int64
+}
+
+type deleteRecord struct {
+	*cacheRecord
+	lastUsedAt      *time.Time
+	usageCount      int
+	lastUsedAtIndex int
+	usageCountIndex int
+}
+
+func sortDeleteRecords(toDelete []*deleteRecord) {
+	sort.Slice(toDelete, func(i, j int) bool {
+		if toDelete[i].lastUsedAt == nil {
+			return true
+		}
+		if toDelete[j].lastUsedAt == nil {
+			return false
+		}
+		return toDelete[i].lastUsedAt.Before(*toDelete[j].lastUsedAt)
+	})
+
+	maxLastUsedIndex := 0
+	var val time.Time
+	for _, v := range toDelete {
+		if v.lastUsedAt != nil && v.lastUsedAt.After(val) {
+			val = *v.lastUsedAt
+			maxLastUsedIndex++
+		}
+		v.lastUsedAtIndex = maxLastUsedIndex
+	}
+
+	sort.Slice(toDelete, func(i, j int) bool {
+		return toDelete[i].usageCount < toDelete[j].usageCount
+	})
+
+	maxUsageCountIndex := 0
+	var count int
+	for _, v := range toDelete {
+		if v.usageCount != count {
+			count = v.usageCount
+			maxUsageCountIndex++
+		}
+		v.usageCountIndex = maxUsageCountIndex
+	}
+
+	sort.Slice(toDelete, func(i, j int) bool {
+		return float64(toDelete[i].lastUsedAtIndex)/float64(maxLastUsedIndex)+
+			float64(toDelete[i].usageCountIndex)/float64(maxUsageCountIndex) <
+			float64(toDelete[j].lastUsedAtIndex)/float64(maxLastUsedIndex)+
+				float64(toDelete[j].usageCountIndex)/float64(maxUsageCountIndex)
 	})
 }

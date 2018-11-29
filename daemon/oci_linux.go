@@ -27,6 +27,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const (
+	inContainerInitPath = "/sbin/" + daemonconfig.DefaultInitBinary
+)
+
 func setResources(s *specs.Spec, r containertypes.Resources) error {
 	weightDevices, err := getBlkioWeightDevices(r)
 	if err != nil {
@@ -494,12 +498,6 @@ func setMounts(daemon *Daemon, s *specs.Spec, c *container.Container, mounts []c
 
 	s.Mounts = defaultMounts
 	for _, m := range mounts {
-		for _, cm := range s.Mounts {
-			if cm.Destination == m.Destination {
-				return duplicateMountPointError(m.Destination)
-			}
-		}
-
 		if m.Source == "tmpfs" {
 			data := m.Data
 			parser := volumemounts.NewParser("linux")
@@ -567,7 +565,11 @@ func setMounts(daemon *Daemon, s *specs.Spec, c *container.Container, mounts []c
 			}
 		}
 
-		opts := []string{"rbind"}
+		bindMode := "rbind"
+		if m.NonRecursive {
+			bindMode = "bind"
+		}
+		opts := []string{bindMode}
 		if !m.Writable {
 			opts = append(opts, "ro")
 		}
@@ -657,19 +659,16 @@ func (daemon *Daemon) populateCommonSpec(s *specs.Spec, c *container.Container) 
 	if c.HostConfig.PidMode.IsPrivate() {
 		if (c.HostConfig.Init != nil && *c.HostConfig.Init) ||
 			(c.HostConfig.Init == nil && daemon.configStore.Init) {
-			s.Process.Args = append([]string{"/dev/init", "--", c.Path}, c.Args...)
-			var path string
-			if daemon.configStore.InitPath == "" {
+			s.Process.Args = append([]string{inContainerInitPath, "--", c.Path}, c.Args...)
+			path := daemon.configStore.InitPath
+			if path == "" {
 				path, err = exec.LookPath(daemonconfig.DefaultInitBinary)
 				if err != nil {
 					return err
 				}
 			}
-			if daemon.configStore.InitPath != "" {
-				path = daemon.configStore.InitPath
-			}
 			s.Mounts = append(s.Mounts, specs.Mount{
-				Destination: "/dev/init",
+				Destination: inContainerInitPath,
 				Type:        "bind",
 				Source:      path,
 				Options:     []string{"bind", "ro"},
@@ -808,7 +807,7 @@ func (daemon *Daemon) createSpec(c *container.Container) (retSpec *specs.Spec, e
 			s.Hooks = &specs.Hooks{
 				Prestart: []specs.Hook{{
 					Path: target,
-					Args: []string{"libnetwork-setkey", c.ID, daemon.netController.ID()},
+					Args: []string{"libnetwork-setkey", "-exec-root=" + daemon.configStore.GetExecRoot(), c.ID, daemon.netController.ID()},
 				}},
 			}
 		}

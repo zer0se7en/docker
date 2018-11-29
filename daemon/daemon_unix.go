@@ -54,11 +54,11 @@ import (
 const (
 	// DefaultShimBinary is the default shim to be used by containerd if none
 	// is specified
-	DefaultShimBinary = "docker-containerd-shim"
+	DefaultShimBinary = "containerd-shim"
 
 	// DefaultRuntimeBinary is the default runtime to be used by
 	// containerd if none is specified
-	DefaultRuntimeBinary = "docker-runc"
+	DefaultRuntimeBinary = "runc"
 
 	// See https://git.kernel.org/cgit/linux/kernel/git/tip/tip.git/tree/kernel/sched/sched.h?id=8cd9234c64c584432f6992fe944ca9e46ca8ea76#n269
 	linuxMinCPUShares = 2
@@ -76,7 +76,7 @@ const (
 
 	// DefaultRuntimeName is the default runtime to be used by
 	// containerd if none is specified
-	DefaultRuntimeName = "docker-runc"
+	DefaultRuntimeName = "runc"
 )
 
 type containerGetter interface {
@@ -109,6 +109,10 @@ func getMemoryResources(config containertypes.Resources) *specs.LinuxMemory {
 
 	if config.KernelMemory != 0 {
 		memory.Kernel = &config.KernelMemory
+	}
+
+	if config.KernelMemoryTCP != 0 {
+		memory.KernelTCP = &config.KernelMemoryTCP
 	}
 
 	return &memory
@@ -482,14 +486,14 @@ func verifyContainerResources(resources *containertypes.Resources, sysInfo *sysi
 	}
 	cpusAvailable, err := sysInfo.IsCpusetCpusAvailable(resources.CpusetCpus)
 	if err != nil {
-		return warnings, fmt.Errorf("Invalid value %s for cpuset cpus", resources.CpusetCpus)
+		return warnings, errors.Wrapf(err, "Invalid value %s for cpuset cpus", resources.CpusetCpus)
 	}
 	if !cpusAvailable {
 		return warnings, fmt.Errorf("Requested CPUs are not available - requested %s, available: %s", resources.CpusetCpus, sysInfo.Cpus)
 	}
 	memsAvailable, err := sysInfo.IsCpusetMemsAvailable(resources.CpusetMems)
 	if err != nil {
-		return warnings, fmt.Errorf("Invalid value %s for cpuset mems", resources.CpusetMems)
+		return warnings, errors.Wrapf(err, "Invalid value %s for cpuset mems", resources.CpusetMems)
 	}
 	if !memsAvailable {
 		return warnings, fmt.Errorf("Requested memory nodes are not available - requested %s, available: %s", resources.CpusetMems, sysInfo.Mems)

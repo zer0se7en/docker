@@ -26,6 +26,7 @@ func delInterface(t *testing.T, ifName string) {
 }
 
 func TestDaemonRestartWithLiveRestore(t *testing.T) {
+	skip.If(t, testEnv.OSType == "windows")
 	skip.If(t, testEnv.IsRemoteDaemon())
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.38"), "skip test from new feature")
 	d := daemon.New(t)
@@ -46,6 +47,7 @@ func TestDaemonRestartWithLiveRestore(t *testing.T) {
 }
 
 func TestDaemonDefaultNetworkPools(t *testing.T) {
+	skip.If(t, testEnv.OSType == "windows")
 	// Remove docker0 bridge and the start daemon defining the predefined address pools
 	skip.If(t, testEnv.IsRemoteDaemon())
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.38"), "skip test from new feature")
@@ -87,6 +89,7 @@ func TestDaemonDefaultNetworkPools(t *testing.T) {
 }
 
 func TestDaemonRestartWithExistingNetwork(t *testing.T) {
+	skip.If(t, testEnv.OSType == "windows")
 	skip.If(t, testEnv.IsRemoteDaemon())
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.38"), "skip test from new feature")
 	defaultNetworkBridge := "docker0"
@@ -119,6 +122,7 @@ func TestDaemonRestartWithExistingNetwork(t *testing.T) {
 }
 
 func TestDaemonRestartWithExistingNetworkWithDefaultPoolRange(t *testing.T) {
+	skip.If(t, testEnv.OSType == "windows")
 	skip.If(t, testEnv.IsRemoteDaemon())
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.38"), "skip test from new feature")
 	defaultNetworkBridge := "docker0"
@@ -167,6 +171,7 @@ func TestDaemonRestartWithExistingNetworkWithDefaultPoolRange(t *testing.T) {
 }
 
 func TestDaemonWithBipAndDefaultNetworkPool(t *testing.T) {
+	skip.If(t, testEnv.OSType == "windows")
 	skip.If(t, testEnv.IsRemoteDaemon())
 	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.38"), "skip test from new feature")
 	defaultNetworkBridge := "docker0"
@@ -188,6 +193,7 @@ func TestDaemonWithBipAndDefaultNetworkPool(t *testing.T) {
 }
 
 func TestServiceWithPredefinedNetwork(t *testing.T) {
+	skip.If(t, testEnv.OSType == "windows")
 	defer setupTest(t)()
 	d := swarm.NewSwarm(t, testEnv)
 	defer d.Stop(t)
@@ -216,6 +222,7 @@ func TestServiceWithPredefinedNetwork(t *testing.T) {
 const ingressNet = "ingress"
 
 func TestServiceRemoveKeepsIngressNetwork(t *testing.T) {
+	skip.If(t, testEnv.OSType == "windows")
 	defer setupTest(t)()
 	d := swarm.NewSwarm(t, testEnv)
 	defer d.Stop(t)
@@ -312,4 +319,113 @@ func noServices(client client.ServiceAPIClient) func(log poll.LogT) poll.Result 
 			return poll.Continue("Service count at %d waiting for 0", len(services))
 		}
 	}
+}
+
+func TestServiceWithDataPathPortInit(t *testing.T) {
+	skip.If(t, testEnv.OSType == "windows")
+	skip.If(t, versions.LessThan(testEnv.DaemonAPIVersion(), "1.40"), "DataPathPort was added in API v1.40")
+	defer setupTest(t)()
+	var ops = []func(*daemon.Daemon){}
+	var datapathPort uint32 = 7777
+	ops = append(ops, daemon.WithSwarmDataPathPort(datapathPort))
+	d := swarm.NewSwarm(t, testEnv, ops...)
+
+	cli := d.NewClientT(t)
+	defer cli.Close()
+
+	// Create a overlay network
+	name := "saanvisthira" + t.Name()
+	network.CreateNoError(t, context.Background(), cli, name,
+		network.WithDriver("overlay"))
+
+	var instances uint64 = 1
+	serviceID := swarm.CreateService(t, d,
+		swarm.ServiceWithReplicas(instances),
+		swarm.ServiceWithNetwork(name),
+	)
+
+	poll.WaitOn(t, serviceRunningCount(cli, serviceID, instances), swarm.ServicePoll)
+
+	info := d.Info(t)
+	assert.Equal(t, info.Swarm.Cluster.DataPathPort, datapathPort)
+	err := cli.ServiceRemove(context.Background(), serviceID)
+	assert.NilError(t, err)
+	d.SwarmLeave(true)
+	d.Stop(t)
+
+	// Clean up , set it back to original one to make sure other tests don't fail
+	// call without datapath port option.
+	ops = []func(*daemon.Daemon){}
+	d = swarm.NewSwarm(t, testEnv, ops...)
+	cli = d.NewClientT(t)
+
+	// Create a overlay network
+	name = "saanvisthira" + t.Name()
+	network.CreateNoError(t, context.Background(), cli, name,
+		network.WithDriver("overlay"))
+
+	serviceID = swarm.CreateService(t, d,
+		swarm.ServiceWithReplicas(instances),
+		swarm.ServiceWithNetwork(name),
+	)
+
+	poll.WaitOn(t, serviceRunningCount(cli, serviceID, instances), swarm.ServicePoll)
+
+	info = d.Info(t)
+	var defaultDataPathPort uint32 = 4789
+	assert.Equal(t, info.Swarm.Cluster.DataPathPort, defaultDataPathPort)
+	err = cli.ServiceRemove(context.Background(), serviceID)
+	assert.NilError(t, err)
+	d.SwarmLeave(true)
+	defer d.Stop(t)
+}
+
+func TestServiceWithDefaultAddressPoolInit(t *testing.T) {
+	skip.If(t, testEnv.OSType == "windows")
+	defer setupTest(t)()
+	var ops = []func(*daemon.Daemon){}
+	ipAddr := []string{"20.20.0.0/16"}
+	ops = append(ops, daemon.WithSwarmDefaultAddrPool(ipAddr))
+	ops = append(ops, daemon.WithSwarmDefaultAddrPoolSubnetSize(24))
+	d := swarm.NewSwarm(t, testEnv, ops...)
+
+	cli := d.NewClientT(t)
+	defer cli.Close()
+
+	// Create a overlay network
+	name := "saanvisthira" + t.Name()
+	network.CreateNoError(t, context.Background(), cli, name,
+		network.WithDriver("overlay"))
+
+	var instances uint64 = 1
+	serviceName := "TestService" + t.Name()
+	serviceID := swarm.CreateService(t, d,
+		swarm.ServiceWithReplicas(instances),
+		swarm.ServiceWithName(serviceName),
+		swarm.ServiceWithNetwork(name),
+	)
+
+	poll.WaitOn(t, serviceRunningCount(cli, serviceID, instances), swarm.ServicePoll)
+
+	_, _, err := cli.ServiceInspectWithRaw(context.Background(), serviceID, types.ServiceInspectOptions{})
+	assert.NilError(t, err)
+
+	out, err := cli.NetworkInspect(context.Background(), name, types.NetworkInspectOptions{})
+	assert.NilError(t, err)
+	t.Logf("%s: NetworkInspect: %+v", t.Name(), out)
+	assert.Assert(t, len(out.IPAM.Config) > 0)
+	assert.Equal(t, out.IPAM.Config[0].Subnet, "20.20.0.0/24")
+
+	err = cli.ServiceRemove(context.Background(), serviceID)
+	assert.NilError(t, err)
+	d.SwarmLeave(true)
+	d.Stop(t)
+
+	// Clean up , set it back to original one to make sure other tests don't fail
+	ipAddr = []string{"10.0.0.0/8"}
+	ops = append(ops, daemon.WithSwarmDefaultAddrPool(ipAddr))
+	ops = append(ops, daemon.WithSwarmDefaultAddrPoolSubnetSize(24))
+	d = swarm.NewSwarm(t, testEnv, ops...)
+	d.SwarmLeave(true)
+	defer d.Stop(t)
 }

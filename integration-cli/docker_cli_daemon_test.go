@@ -44,6 +44,8 @@ import (
 	"gotest.tools/icmd"
 )
 
+const containerdSocket = "/var/run/docker/containerd/containerd.sock"
+
 // TestLegacyDaemonCommand test starting docker daemon using "deprecated" docker daemon
 // command. Remove this test when we remove this.
 func (s *DockerDaemonSuite) TestLegacyDaemonCommand(c *check.C) {
@@ -570,7 +572,7 @@ func (s *DockerDaemonSuite) TestDaemonExitOnFailure(c *check.C) {
 			c.Fatalf("Expected daemon not to start, got %v", err)
 		}
 		// look in the log and make sure we got the message that daemon is shutting down
-		icmd.RunCommand("grep", "Error starting daemon", s.d.LogFileName()).Assert(c, icmd.Success)
+		icmd.RunCommand("grep", "failed to start daemon", s.d.LogFileName()).Assert(c, icmd.Success)
 	} else {
 		//if we didn't get an error and the daemon is running, this is a failure
 		c.Fatal("Conflicting options should cause the daemon to error out with a failure")
@@ -1449,7 +1451,7 @@ func (s *DockerDaemonSuite) TestCleanupMountsAfterDaemonAndContainerKill(c *chec
 	c.Assert(d.Kill(), check.IsNil)
 
 	// kill the container
-	icmd.RunCommand(ctrBinary, "--address", "/var/run/docker/containerd/docker-containerd.sock",
+	icmd.RunCommand(ctrBinary, "--address", containerdSocket,
 		"--namespace", moby_daemon.ContainersNamespace, "tasks", "kill", id).Assert(c, icmd.Success)
 
 	// restart daemon.
@@ -1971,7 +1973,7 @@ func (s *DockerDaemonSuite) TestDaemonRestartWithKilledRunningContainer(t *check
 	}
 
 	// kill the container
-	icmd.RunCommand(ctrBinary, "--address", "/var/run/docker/containerd/docker-containerd.sock",
+	icmd.RunCommand(ctrBinary, "--address", containerdSocket,
 		"--namespace", moby_daemon.ContainersNamespace, "tasks", "kill", cid).Assert(t, icmd.Success)
 
 	// Give time to containerd to process the command if we don't
@@ -2074,7 +2076,7 @@ func (s *DockerDaemonSuite) TestDaemonRestartWithUnpausedRunningContainer(t *che
 	// resume the container
 	result := icmd.RunCommand(
 		ctrBinary,
-		"--address", "/var/run/docker/containerd/docker-containerd.sock",
+		"--address", containerdSocket,
 		"--namespace", moby_daemon.ContainersNamespace,
 		"tasks", "resume", cid)
 	result.Assert(t, icmd.Success)
@@ -2409,7 +2411,7 @@ func (s *DockerDaemonSuite) TestRunWithRuntimeFromConfigFile(c *check.C) {
 {
     "runtimes": {
         "oci": {
-            "path": "docker-runc"
+            "path": "runc"
         },
         "vm": {
             "path": "/usr/local/bin/vm-manager",
@@ -2491,7 +2493,7 @@ func (s *DockerDaemonSuite) TestRunWithRuntimeFromConfigFile(c *check.C) {
     "default-runtime": "vm",
     "runtimes": {
         "oci": {
-            "path": "docker-runc"
+            "path": "runc"
         },
         "vm": {
             "path": "/usr/local/bin/vm-manager",
@@ -2517,7 +2519,7 @@ func (s *DockerDaemonSuite) TestRunWithRuntimeFromConfigFile(c *check.C) {
 }
 
 func (s *DockerDaemonSuite) TestRunWithRuntimeFromCommandLine(c *check.C) {
-	s.d.StartWithBusybox(c, "--add-runtime", "oci=docker-runc", "--add-runtime", "vm=/usr/local/bin/vm-manager")
+	s.d.StartWithBusybox(c, "--add-runtime", "oci=runc", "--add-runtime", "vm=/usr/local/bin/vm-manager")
 
 	// Run with default runtime
 	out, err := s.d.Cmd("run", "--rm", "busybox", "ls")
@@ -2564,7 +2566,7 @@ func (s *DockerDaemonSuite) TestRunWithRuntimeFromCommandLine(c *check.C) {
 
 	// Check that we can select a default runtime
 	s.d.Stop(c)
-	s.d.StartWithBusybox(c, "--default-runtime=vm", "--add-runtime", "oci=docker-runc", "--add-runtime", "vm=/usr/local/bin/vm-manager")
+	s.d.StartWithBusybox(c, "--default-runtime=vm", "--add-runtime", "oci=runc", "--add-runtime", "vm=/usr/local/bin/vm-manager")
 
 	out, err = s.d.Cmd("run", "--rm", "busybox", "ls")
 	c.Assert(err, check.NotNil, check.Commentf("%s", out))
@@ -2899,67 +2901,6 @@ func (s *DockerDaemonSuite) TestShmSizeReload(c *check.C) {
 	out, err = s.d.Cmd("inspect", "--format", "{{.HostConfig.ShmSize}}", name)
 	c.Assert(err, check.IsNil, check.Commentf("Output: %s", out))
 	c.Assert(strings.TrimSpace(out), check.Equals, fmt.Sprintf("%v", size))
-}
-
-// this is used to test both "private" and "shareable" daemon default ipc modes
-func testDaemonIpcPrivateShareable(d *daemon.Daemon, c *check.C, mustExist bool) {
-	name := "test-ipcmode"
-	_, err := d.Cmd("run", "-d", "--name", name, "busybox", "top")
-	c.Assert(err, checker.IsNil)
-
-	// get major:minor pair for /dev/shm from container's /proc/self/mountinfo
-	cmd := "awk '($5 == \"/dev/shm\") {printf $3}' /proc/self/mountinfo"
-	mm, err := d.Cmd("exec", "-i", name, "sh", "-c", cmd)
-	c.Assert(err, checker.IsNil)
-	c.Assert(mm, checker.Matches, "^[0-9]+:[0-9]+$")
-
-	exists, err := testIpcCheckDevExists(mm)
-	c.Assert(err, checker.IsNil)
-	c.Logf("[testDaemonIpcPrivateShareable] ipcdev: %v, exists: %v, mustExist: %v\n", mm, exists, mustExist)
-	c.Assert(exists, checker.Equals, mustExist)
-}
-
-// TestDaemonIpcModeShareable checks that --default-ipc-mode shareable works as intended.
-func (s *DockerDaemonSuite) TestDaemonIpcModeShareable(c *check.C) {
-	testRequires(c, DaemonIsLinux, SameHostDaemon)
-
-	s.d.StartWithBusybox(c, "--default-ipc-mode", "shareable")
-	testDaemonIpcPrivateShareable(s.d, c, true)
-}
-
-// TestDaemonIpcModePrivate checks that --default-ipc-mode private works as intended.
-func (s *DockerDaemonSuite) TestDaemonIpcModePrivate(c *check.C) {
-	testRequires(c, DaemonIsLinux, SameHostDaemon)
-
-	s.d.StartWithBusybox(c, "--default-ipc-mode", "private")
-	testDaemonIpcPrivateShareable(s.d, c, false)
-}
-
-// used to check if an IpcMode given in config works as intended
-func testDaemonIpcFromConfig(s *DockerDaemonSuite, c *check.C, mode string, mustExist bool) {
-	f, err := ioutil.TempFile("", "test-daemon-ipc-config")
-	c.Assert(err, checker.IsNil)
-	defer os.Remove(f.Name())
-
-	config := `{"default-ipc-mode": "` + mode + `"}`
-	_, err = f.WriteString(config)
-	c.Assert(f.Close(), checker.IsNil)
-	c.Assert(err, checker.IsNil)
-
-	s.d.StartWithBusybox(c, "--config-file", f.Name())
-	testDaemonIpcPrivateShareable(s.d, c, mustExist)
-}
-
-// TestDaemonIpcModePrivateFromConfig checks that "default-ipc-mode: private" config works as intended.
-func (s *DockerDaemonSuite) TestDaemonIpcModePrivateFromConfig(c *check.C) {
-	testRequires(c, DaemonIsLinux, SameHostDaemon)
-	testDaemonIpcFromConfig(s, c, "private", false)
-}
-
-// TestDaemonIpcModeShareableFromConfig checks that "default-ipc-mode: shareable" config works as intended.
-func (s *DockerDaemonSuite) TestDaemonIpcModeShareableFromConfig(c *check.C) {
-	testRequires(c, DaemonIsLinux, SameHostDaemon)
-	testDaemonIpcFromConfig(s, c, "shareable", true)
 }
 
 func testDaemonStartIpcMode(c *check.C, from, mode string, valid bool) {

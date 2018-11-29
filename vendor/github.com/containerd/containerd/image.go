@@ -37,6 +37,8 @@ type Image interface {
 	Name() string
 	// Target descriptor for the image content
 	Target() ocispec.Descriptor
+	// Labels of the image
+	Labels() map[string]string
 	// Unpack unpacks the image's content into a snapshot
 	Unpack(context.Context, string) error
 	// RootFS returns the unpacked diffids that make up images rootfs.
@@ -63,7 +65,7 @@ func NewImage(client *Client, i images.Image) Image {
 }
 
 // NewImageWithPlatform returns a client image object from the metadata image
-func NewImageWithPlatform(client *Client, i images.Image, platform string) Image {
+func NewImageWithPlatform(client *Client, i images.Image, platform platforms.MatchComparer) Image {
 	return &image{
 		client:   client,
 		i:        i,
@@ -75,7 +77,7 @@ type image struct {
 	client *Client
 
 	i        images.Image
-	platform string
+	platform platforms.MatchComparer
 }
 
 func (i *image) Name() string {
@@ -84,6 +86,10 @@ func (i *image) Name() string {
 
 func (i *image) Target() ocispec.Descriptor {
 	return i.i.Target
+}
+
+func (i *image) Labels() map[string]string {
+	return i.i.Labels
 }
 
 func (i *image) RootFS(ctx context.Context) ([]digest.Digest, error) {
@@ -186,7 +192,7 @@ func (i *image) Unpack(ctx context.Context, snapshotterName string) error {
 	return nil
 }
 
-func (i *image) getLayers(ctx context.Context, platform string) ([]rootfs.Layer, error) {
+func (i *image) getLayers(ctx context.Context, platform platforms.MatchComparer) ([]rootfs.Layer, error) {
 	cs := i.client.ContentStore()
 
 	manifest, err := images.Manifest(ctx, cs, i.i.Target, platform)

@@ -4,8 +4,10 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -36,6 +38,9 @@ const (
 	keyTargetPlatform     = "platform"
 	keyMultiPlatform      = "multi-platform"
 	keyImageResolveMode   = "image-resolve-mode"
+	keyGlobalAddHosts     = "add-hosts"
+	keyForceNetwork       = "force-network-mode"
+	keyOverrideCopyImage  = "override-copy-image" // remove after CopyOp implemented
 )
 
 var httpPrefix = regexp.MustCompile("^https?://")
@@ -43,6 +48,9 @@ var gitUrlPathWithFragmentSuffix = regexp.MustCompile("\\.git(?:#.+)?$")
 
 func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 	opts := c.BuildOpts().Opts
+	caps := c.BuildOpts().LLBCaps
+
+	marshalOpts := []llb.ConstraintsOpt{llb.WithCaps(caps)}
 
 	defaultBuildPlatform := platforms.DefaultSpec()
 	if workers := c.BuildOpts().Workers; len(workers) > 0 && len(workers[0].Platforms) > 0 {
@@ -64,6 +72,16 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 		return nil, err
 	}
 
+	extraHosts, err := parseExtraHosts(opts[keyGlobalAddHosts])
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse additional hosts")
+	}
+
+	defaultNetMode, err := parseNetMode(opts[keyForceNetwork])
+	if err != nil {
+		return nil, err
+	}
+
 	filename := opts[keyFilename]
 	if filename == "" {
 		filename = defaultDockerfileName
@@ -78,13 +96,10 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 		}
 	}
 
-	name := "load Dockerfile"
-	if filename != "Dockerfile" {
-		name += " from " + filename
-	}
+	name := "load build definition from " + filename
 
 	src := llb.Local(LocalNameDockerfile,
-		llb.IncludePatterns([]string{filename}),
+		llb.FollowPaths([]string{filename}),
 		llb.SessionID(c.BuildOpts().SessionID),
 		llb.SharedKeyHint(defaultDockerfileName),
 		dockerfile2llb.WithInternalName(name),
@@ -96,7 +111,7 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 		buildContext = &src
 	} else if httpPrefix.MatchString(opts[LocalNameContext]) {
 		httpContext := llb.HTTP(opts[LocalNameContext], llb.Filename("context"), dockerfile2llb.WithInternalName("load remote build context"))
-		def, err := httpContext.Marshal()
+		def, err := httpContext.Marshal(marshalOpts...)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to marshal httpcontext")
 		}
@@ -122,7 +137,11 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 			return nil, errors.Errorf("failed to read downloaded context")
 		}
 		if isArchive(dt) {
-			unpack := llb.Image(dockerfile2llb.CopyImage, dockerfile2llb.WithInternalName("helper image for file operations")).
+			copyImage := opts[keyOverrideCopyImage]
+			if copyImage == "" {
+				copyImage = dockerfile2llb.DefaultCopyImage
+			}
+			unpack := llb.Image(copyImage, dockerfile2llb.WithInternalName("helper image for file operations")).
 				Run(llb.Shlex("copy --unpack /src/context /out/"), llb.ReadonlyRootFS(), dockerfile2llb.WithInternalName("extracting build context"))
 			unpack.AddMount("/src", httpContext, llb.Readonly)
 			src = unpack.AddMount("/out", llb.Scratch())
@@ -135,7 +154,7 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 		}
 	}
 
-	def, err := src.Marshal()
+	def, err := src.Marshal(marshalOpts...)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to marshal local source")
 	}
@@ -170,13 +189,13 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 			if dockerignoreState == nil {
 				st := llb.Local(LocalNameContext,
 					llb.SessionID(c.BuildOpts().SessionID),
-					llb.IncludePatterns([]string{dockerignoreFilename}),
+					llb.FollowPaths([]string{dockerignoreFilename}),
 					llb.SharedKeyHint(dockerignoreFilename),
 					dockerfile2llb.WithInternalName("load "+dockerignoreFilename),
 				)
 				dockerignoreState = &st
 			}
-			def, err := dockerignoreState.Marshal()
+			def, err := dockerignoreState.Marshal(marshalOpts...)
 			if err != nil {
 				return err
 			}
@@ -238,18 +257,22 @@ func Build(ctx context.Context, c client.Client) (*client.Result, error) {
 		func(i int, tp *specs.Platform) {
 			eg.Go(func() error {
 				st, img, err := dockerfile2llb.Dockerfile2LLB(ctx, dtDockerfile, dockerfile2llb.ConvertOpt{
-					Target:           opts[keyTarget],
-					MetaResolver:     c,
-					BuildArgs:        filter(opts, buildArgPrefix),
-					Labels:           filter(opts, labelPrefix),
-					SessionID:        c.BuildOpts().SessionID,
-					BuildContext:     buildContext,
-					Excludes:         excludes,
-					IgnoreCache:      ignoreCache,
-					TargetPlatform:   tp,
-					BuildPlatforms:   buildPlatforms,
-					ImageResolveMode: resolveMode,
-					PrefixPlatform:   exportMap,
+					Target:            opts[keyTarget],
+					MetaResolver:      c,
+					BuildArgs:         filter(opts, buildArgPrefix),
+					Labels:            filter(opts, labelPrefix),
+					SessionID:         c.BuildOpts().SessionID,
+					BuildContext:      buildContext,
+					Excludes:          excludes,
+					IgnoreCache:       ignoreCache,
+					TargetPlatform:    tp,
+					BuildPlatforms:    buildPlatforms,
+					ImageResolveMode:  resolveMode,
+					PrefixPlatform:    exportMap,
+					ExtraHosts:        extraHosts,
+					ForceNetMode:      defaultNetMode,
+					OverrideCopyImage: opts[keyOverrideCopyImage],
+					LLBCaps:           &caps,
 				})
 
 				if err != nil {
@@ -411,5 +434,47 @@ func parseResolveMode(v string) (llb.ResolveMode, error) {
 		return llb.ResolveModePreferLocal, nil
 	default:
 		return 0, errors.Errorf("invalid image-resolve-mode: %s", v)
+	}
+}
+
+func parseExtraHosts(v string) ([]llb.HostIP, error) {
+	if v == "" {
+		return nil, nil
+	}
+	out := make([]llb.HostIP, 0)
+	csvReader := csv.NewReader(strings.NewReader(v))
+	fields, err := csvReader.Read()
+	if err != nil {
+		return nil, err
+	}
+	for _, field := range fields {
+		parts := strings.SplitN(field, "=", 2)
+		if len(parts) != 2 {
+			return nil, errors.Errorf("invalid key-value pair %s", field)
+		}
+		key := strings.ToLower(parts[0])
+		val := strings.ToLower(parts[1])
+		ip := net.ParseIP(val)
+		if ip == nil {
+			return nil, errors.Errorf("failed to parse IP %s", val)
+		}
+		out = append(out, llb.HostIP{Host: key, IP: ip})
+	}
+	return out, nil
+}
+
+func parseNetMode(v string) (pb.NetMode, error) {
+	if v == "" {
+		return llb.NetModeSandbox, nil
+	}
+	switch v {
+	case "none":
+		return llb.NetModeNone, nil
+	case "host":
+		return llb.NetModeHost, nil
+	case "sandbox":
+		return llb.NetModeSandbox, nil
+	default:
+		return 0, errors.Errorf("invalid netmode %s", v)
 	}
 }

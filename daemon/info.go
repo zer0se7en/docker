@@ -2,6 +2,7 @@ package daemon // import "github.com/docker/docker/daemon"
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -61,13 +62,14 @@ func (daemon *Daemon) SystemInfo() (*types.Info, error) {
 		ServerVersion:      dockerversion.Version,
 		ClusterStore:       daemon.configStore.ClusterStore,
 		ClusterAdvertise:   daemon.configStore.ClusterAdvertise,
-		HTTPProxy:          sockets.GetProxyEnv("http_proxy"),
-		HTTPSProxy:         sockets.GetProxyEnv("https_proxy"),
+		HTTPProxy:          maskCredentials(sockets.GetProxyEnv("http_proxy")),
+		HTTPSProxy:         maskCredentials(sockets.GetProxyEnv("https_proxy")),
 		NoProxy:            sockets.GetProxyEnv("no_proxy"),
 		LiveRestoreEnabled: daemon.configStore.LiveRestoreEnabled,
 		Isolation:          daemon.defaultIsolation,
 	}
 
+	daemon.fillAPIInfo(v)
 	// Retrieve platform specific info
 	daemon.fillPlatformInfo(v, sysInfo)
 	daemon.fillDriverInfo(v)
@@ -129,11 +131,17 @@ func (daemon *Daemon) fillDriverInfo(v *types.Info) {
 		if len(daemon.graphDrivers) > 1 {
 			drivers += fmt.Sprintf(" (%s) ", os)
 		}
+		switch gd {
+		case "aufs", "devicemapper", "overlay":
+			v.Warnings = append(v.Warnings, fmt.Sprintf("WARNING: the %s storage-driver is deprecated, and will be removed in a future release.", gd))
+		}
 	}
 	drivers = strings.TrimSpace(drivers)
 
 	v.Driver = drivers
 	v.DriverStatus = ds
+
+	fillDriverWarnings(v)
 }
 
 func (daemon *Daemon) fillPluginsInfo(v *types.Info) {
@@ -167,6 +175,32 @@ func (daemon *Daemon) fillSecurityOptions(v *types.Info, sysInfo *sysinfo.SysInf
 		securityOptions = append(securityOptions, "name=userns")
 	}
 	v.SecurityOptions = securityOptions
+}
+
+func (daemon *Daemon) fillAPIInfo(v *types.Info) {
+	const warn string = `
+         Access to the remote API is equivalent to root access on the host. Refer
+         to the 'Docker daemon attack surface' section in the documentation for
+         more information: https://docs.docker.com/engine/security/security/#docker-daemon-attack-surface`
+
+	cfg := daemon.configStore
+	for _, host := range cfg.Hosts {
+		// cnf.Hosts is normalized during startup, so should always have a scheme/proto
+		h := strings.SplitN(host, "://", 2)
+		proto := h[0]
+		addr := h[1]
+		if proto != "tcp" {
+			continue
+		}
+		if !cfg.TLS {
+			v.Warnings = append(v.Warnings, fmt.Sprintf("WARNING: API is accessible on http://%s without encryption.%s", addr, warn))
+			continue
+		}
+		if !cfg.TLSVerify {
+			v.Warnings = append(v.Warnings, fmt.Sprintf("WARNING: API is accessible on https://%s without TLS client verification.%s", addr, warn))
+			continue
+		}
+	}
 }
 
 func hostName() string {
@@ -215,4 +249,14 @@ func operatingSystem() string {
 		}
 	}
 	return operatingSystem
+}
+
+func maskCredentials(rawURL string) string {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil || parsedURL.User == nil {
+		return rawURL
+	}
+	parsedURL.User = url.UserPassword("xxxxx", "xxxxx")
+	maskedURL := parsedURL.String()
+	return maskedURL
 }

@@ -32,7 +32,7 @@ const (
 	privateRegistryURL = registry.DefaultURL
 
 	// path to containerd's ctr binary
-	ctrBinary = "docker-containerd-ctr"
+	ctrBinary = "ctr"
 
 	// the docker daemon binary to use
 	dockerdBinary = "dockerd"
@@ -333,7 +333,7 @@ func (s *DockerSwarmSuite) AddDaemon(c *check.C, joinSwarm, manager bool) *daemo
 			d.StartAndSwarmInit(c)
 		}
 	} else {
-		d.StartWithBusybox(c, "--iptables=false", "--swarm-default-advertise-addr=lo")
+		d.StartNode(c)
 	}
 
 	s.portIndex++

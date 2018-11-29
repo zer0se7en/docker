@@ -23,7 +23,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/filters"
@@ -34,6 +33,7 @@ import (
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
+	bolt "go.etcd.io/bbolt"
 )
 
 type contentStore struct {
@@ -553,71 +553,83 @@ func (nw *namespacedWriter) Commit(ctx context.Context, size int64, expected dig
 	nw.l.RLock()
 	defer nw.l.RUnlock()
 
-	return update(ctx, nw.db, func(tx *bolt.Tx) error {
+	var innerErr error
+
+	if err := update(ctx, nw.db, func(tx *bolt.Tx) error {
+		dgst, err := nw.commit(ctx, tx, size, expected, opts...)
+		if err != nil {
+			if !errdefs.IsAlreadyExists(err) {
+				return err
+			}
+			innerErr = err
+		}
 		bkt := getIngestsBucket(tx, nw.namespace)
 		if bkt != nil {
 			if err := bkt.DeleteBucket([]byte(nw.ref)); err != nil && err != bolt.ErrBucketNotFound {
 				return err
 			}
 		}
-		dgst, err := nw.commit(ctx, tx, size, expected, opts...)
-		if err != nil {
-			return err
-		}
 		if err := removeIngestLease(ctx, tx, nw.ref); err != nil {
 			return err
 		}
 		return addContentLease(ctx, tx, dgst)
-	})
+	}); err != nil {
+		return err
+	}
+
+	return innerErr
 }
 
 func (nw *namespacedWriter) commit(ctx context.Context, tx *bolt.Tx, size int64, expected digest.Digest, opts ...content.Opt) (digest.Digest, error) {
 	var base content.Info
 	for _, opt := range opts {
 		if err := opt(&base); err != nil {
+			if nw.w != nil {
+				nw.w.Close()
+			}
 			return "", err
 		}
 	}
 	if err := validateInfo(&base); err != nil {
+		if nw.w != nil {
+			nw.w.Close()
+		}
 		return "", err
 	}
 
 	var actual digest.Digest
 	if nw.w == nil {
 		if size != 0 && size != nw.desc.Size {
-			return "", errors.Errorf("%q failed size validation: %v != %v", nw.ref, nw.desc.Size, size)
+			return "", errors.Wrapf(errdefs.ErrFailedPrecondition, "%q failed size validation: %v != %v", nw.ref, nw.desc.Size, size)
 		}
 		if expected != "" && expected != nw.desc.Digest {
-			return "", errors.Errorf("%q unexpected digest", nw.ref)
+			return "", errors.Wrapf(errdefs.ErrFailedPrecondition, "%q unexpected digest", nw.ref)
 		}
 		size = nw.desc.Size
 		actual = nw.desc.Digest
-		if getBlobBucket(tx, nw.namespace, actual) != nil {
-			return "", errors.Wrapf(errdefs.ErrAlreadyExists, "content %v", actual)
-		}
 	} else {
 		status, err := nw.w.Status()
 		if err != nil {
+			nw.w.Close()
 			return "", err
 		}
 		if size != 0 && size != status.Offset {
-			return "", errors.Errorf("%q failed size validation: %v != %v", nw.ref, status.Offset, size)
+			nw.w.Close()
+			return "", errors.Wrapf(errdefs.ErrFailedPrecondition, "%q failed size validation: %v != %v", nw.ref, status.Offset, size)
 		}
 		size = status.Offset
 		actual = nw.w.Digest()
 
-		if err := nw.w.Commit(ctx, size, expected); err != nil {
-			if !errdefs.IsAlreadyExists(err) {
-				return "", err
-			}
-			if getBlobBucket(tx, nw.namespace, actual) != nil {
-				return "", errors.Wrapf(errdefs.ErrAlreadyExists, "content %v", actual)
-			}
+		if err := nw.w.Commit(ctx, size, expected); err != nil && !errdefs.IsAlreadyExists(err) {
+			return "", err
 		}
 	}
 
 	bkt, err := createBlobBucket(tx, nw.namespace, actual)
 	if err != nil {
+		if err == bolt.ErrBucketExists {
+			return actual, errors.Wrapf(errdefs.ErrAlreadyExists, "content %v", actual)
+		}
 		return "", err
 	}
 

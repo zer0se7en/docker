@@ -38,6 +38,7 @@ type logT interface {
 }
 
 const defaultDockerdBinary = "dockerd"
+const containerdSocket = "/var/run/docker/containerd/containerd.sock"
 
 var errDaemonNotStarted = errors.New("daemon not started")
 
@@ -73,7 +74,9 @@ type Daemon struct {
 	// swarm related field
 	swarmListenAddr string
 	SwarmPort       int // FIXME(vdemeester) should probably not be exported
-
+	DefaultAddrPool []string
+	SubnetSize      uint32
+	DataPathPort    uint32
 	// cached information
 	CachedInfo types.Info
 }
@@ -110,12 +113,13 @@ func New(t testingT, ops ...func(*Daemon)) *Daemon {
 		}
 	}
 	d := &Daemon{
-		id:              id,
-		Folder:          daemonFolder,
-		Root:            daemonRoot,
-		storageDriver:   storageDriver,
-		userlandProxy:   userlandProxy,
-		execRoot:        filepath.Join(os.TempDir(), "docker-execroot", id),
+		id:            id,
+		Folder:        daemonFolder,
+		Root:          daemonRoot,
+		storageDriver: storageDriver,
+		userlandProxy: userlandProxy,
+		// dxr stands for docker-execroot (shortened for avoiding unix(7) path length limitation)
+		execRoot:        filepath.Join(os.TempDir(), "dxr", id),
 		dockerdBinary:   defaultDockerdBinary,
 		swarmListenAddr: defaultSwarmListenAddr,
 		SwarmPort:       DefaultSwarmPort,
@@ -200,7 +204,7 @@ func (d *Daemon) Start(t testingT, args ...string) {
 		ht.Helper()
 	}
 	if err := d.StartWithError(args...); err != nil {
-		t.Fatalf("Error starting daemon with arguments %v : %v", args, err)
+		t.Fatalf("failed to start daemon with arguments %v : %v", args, err)
 	}
 }
 
@@ -223,7 +227,7 @@ func (d *Daemon) StartWithLogFile(out *os.File, providedArgs ...string) error {
 		return errors.Wrapf(err, "[%s] could not find docker binary in $PATH", d.id)
 	}
 	args := append(d.GlobalFlags,
-		"--containerd", "/var/run/docker/containerd/docker-containerd.sock",
+		"--containerd", containerdSocket,
 		"--data-root", d.Root,
 		"--exec-root", d.execRoot,
 		"--pidfile", fmt.Sprintf("%s/docker.pid", d.Folder),
@@ -282,7 +286,10 @@ func (d *Daemon) StartWithLogFile(out *os.File, providedArgs ...string) error {
 
 	d.Wait = wait
 
-	tick := time.Tick(500 * time.Millisecond)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	tick := ticker.C
+
 	// make sure daemon is ready to receive requests
 	startTime := time.Now().Unix()
 	for {
@@ -420,7 +427,9 @@ func (d *Daemon) StopWithError() error {
 	}()
 
 	i := 1
-	tick := time.Tick(time.Second)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	tick := ticker.C
 
 	if err := d.cmd.Process.Signal(os.Interrupt); err != nil {
 		if strings.Contains(err.Error(), "os: process already finished") {
