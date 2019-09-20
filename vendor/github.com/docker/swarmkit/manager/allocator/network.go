@@ -184,7 +184,7 @@ func (a *Allocator) doNetworkAlloc(ctx context.Context, ev events.Event) {
 		}
 		if IsIngressNetwork(n) && nc.ingressNetwork != nil {
 			log.G(ctx).Errorf("Cannot allocate ingress network %s (%s) because another ingress network is already present: %s (%s)",
-				n.ID, n.Spec.Annotations.Name, nc.ingressNetwork.ID, nc.ingressNetwork.Spec.Annotations)
+				n.ID, n.Spec.Annotations.Name, nc.ingressNetwork.ID, nc.ingressNetwork.Spec.Annotations.Name)
 			break
 		}
 
@@ -989,8 +989,11 @@ func (a *Allocator) allocateNode(ctx context.Context, node *api.Node, existingAd
 
 	nc := a.netCtx
 
+	var nwIDs = make(map[string]struct{}, len(networks))
+
 	// go through all of the networks we've passed in
 	for _, network := range networks {
+		nwIDs[network.ID] = struct{}{}
 
 		// for each one, create space for an attachment. then, search through
 		// all of the attachments already on the node. if the attachment
@@ -1049,17 +1052,8 @@ func (a *Allocator) allocateNode(ctx context.Context, node *api.Node, existingAd
 	// https://github.com/golang/go/wiki/SliceTricks#filtering-without-allocating
 	attachments := node.Attachments[:0]
 	for _, attach := range node.Attachments {
-		// for every attachment, go through every network. if the attachment
-		// belongs to one of the networks, then go to the next attachment. if
-		// no network matches, then the the attachment should be removed.
-		attachmentBelongs := false
-		for _, network := range networks {
-			if network.ID == attach.Network.ID {
-				attachmentBelongs = true
-				break
-			}
-		}
-		if attachmentBelongs {
+		if _, ok := nwIDs[attach.Network.ID]; ok {
+			// attachment belongs to one of the networks, so keep it
 			attachments = append(attachments, attach)
 		} else {
 			// free the attachment and remove it from the node's attachments by

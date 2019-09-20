@@ -9,7 +9,7 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/go-connections/nat"
-	"github.com/hashicorp/go-memdb"
+	memdb "github.com/hashicorp/go-memdb"
 	"github.com/sirupsen/logrus"
 )
 
@@ -473,7 +473,7 @@ type namesByContainerIDIndexer struct{}
 func (e *namesByContainerIDIndexer) FromObject(obj interface{}) (bool, []byte, error) {
 	n, ok := obj.(nameAssociation)
 	if !ok {
-		return false, nil, fmt.Errorf(`%T does not have type "nameAssocation"`, obj)
+		return false, nil, fmt.Errorf(`%T does not have type "nameAssociation"`, obj)
 	}
 
 	// Add the null character as a terminator

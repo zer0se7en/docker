@@ -1,6 +1,7 @@
 package llbsolver
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/containerd/containerd/platforms"
@@ -80,10 +81,20 @@ func RuntimePlatforms(p []specs.Platform) LoadOpt {
 				defaultPlatform = &pb.Platform{
 					OS:           p.OS,
 					Architecture: p.Architecture,
+					Variant:      p.Variant,
 				}
 			}
 			op.Platform = defaultPlatform
 		}
+		platform := specs.Platform{OS: op.Platform.OS, Architecture: op.Platform.Architecture, Variant: op.Platform.Variant}
+		normalizedPlatform := platforms.Normalize(platform)
+
+		op.Platform = &pb.Platform{
+			OS:           normalizedPlatform.OS,
+			Architecture: normalizedPlatform.Architecture,
+			Variant:      normalizedPlatform.Variant,
+		}
+
 		if _, ok := op.Op.(*pb.Op_Exec); ok {
 			var found bool
 			for _, pp := range pp {
@@ -109,14 +120,43 @@ func ValidateEntitlements(ent entitlements.Set) LoadOpt {
 					return errors.Errorf("%s is not allowed", entitlements.EntitlementNetworkHost)
 				}
 			}
-			if op.Exec.Network == pb.NetMode_NONE {
-				if !ent.Allowed(entitlements.EntitlementNetworkNone) {
-					return errors.Errorf("%s is not allowed", entitlements.EntitlementNetworkNone)
+
+			if op.Exec.Security == pb.SecurityMode_INSECURE {
+				if !ent.Allowed(entitlements.EntitlementSecurityInsecure) {
+					return errors.Errorf("%s is not allowed", entitlements.EntitlementSecurityInsecure)
 				}
 			}
 		}
 		return nil
 	}
+}
+
+type detectPrunedCacheID struct {
+	ids map[string]struct{}
+}
+
+func (dpc *detectPrunedCacheID) Load(op *pb.Op, md *pb.OpMetadata, opt *solver.VertexOptions) error {
+	if md == nil || !md.IgnoreCache {
+		return nil
+	}
+	switch op := op.Op.(type) {
+	case *pb.Op_Exec:
+		for _, m := range op.Exec.GetMounts() {
+			if m.MountType == pb.MountType_CACHE {
+				if m.CacheOpt != nil {
+					id := m.CacheOpt.ID
+					if id == "" {
+						id = m.Dest
+					}
+					if dpc.ids == nil {
+						dpc.ids = map[string]struct{}{}
+					}
+					dpc.ids[id] = struct{}{}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func Load(def *pb.Definition, opts ...LoadOpt) (solver.Edge, error) {
@@ -144,6 +184,7 @@ func newVertex(dgst digest.Digest, op *pb.Op, opMeta *pb.OpMetadata, load func(d
 			return nil, err
 		}
 	}
+
 	vtx := &vertex{sys: op, options: opt, digest: dgst, name: llbOpName(op)}
 	for _, in := range op.Inputs {
 		sub, err := load(in.Digest)
@@ -175,8 +216,15 @@ func loadLLB(def *pb.Definition, fn func(digest.Digest, *pb.Op, func(digest.Dige
 		allOps[dgst] = &op
 	}
 
+	if len(allOps) < 2 {
+		return solver.Edge{}, errors.Errorf("invalid LLB with %d vertexes", len(allOps))
+	}
+
 	lastOp := allOps[dgst]
 	delete(allOps, dgst)
+	if len(lastOp.Inputs) == 0 {
+		return solver.Edge{}, errors.Errorf("invalid LLB with no inputs on last vertex")
+	}
 	dgst = lastOp.Inputs[0].Digest
 
 	cache := make(map[digest.Digest]solver.Vertex)
@@ -186,7 +234,16 @@ func loadLLB(def *pb.Definition, fn func(digest.Digest, *pb.Op, func(digest.Dige
 		if v, ok := cache[dgst]; ok {
 			return v, nil
 		}
-		v, err := fn(dgst, allOps[dgst], rec)
+		op, ok := allOps[dgst]
+		if !ok {
+			return nil, errors.Errorf("invalid missing input digest %s", dgst)
+		}
+
+		if err := ValidateOp(op); err != nil {
+			return nil, err
+		}
+
+		v, err := fn(dgst, op, rec)
 		if err != nil {
 			return nil, err
 		}
@@ -214,9 +271,78 @@ func llbOpName(op *pb.Op) string {
 		return op.Source.Identifier
 	case *pb.Op_Exec:
 		return strings.Join(op.Exec.Meta.Args, " ")
+	case *pb.Op_File:
+		return fileOpName(op.File.Actions)
 	case *pb.Op_Build:
 		return "build"
 	default:
 		return "unknown"
 	}
+}
+
+func ValidateOp(op *pb.Op) error {
+	if op == nil {
+		return errors.Errorf("invalid nil op")
+	}
+
+	switch op := op.Op.(type) {
+	case *pb.Op_Source:
+		if op.Source == nil {
+			return errors.Errorf("invalid nil source op")
+		}
+	case *pb.Op_Exec:
+		if op.Exec == nil {
+			return errors.Errorf("invalid nil exec op")
+		}
+		if op.Exec.Meta == nil {
+			return errors.Errorf("invalid exec op with no meta")
+		}
+		if len(op.Exec.Meta.Args) == 0 {
+			return errors.Errorf("invalid exec op with no args")
+		}
+		if len(op.Exec.Mounts) == 0 {
+			return errors.Errorf("invalid exec op with no mounts")
+		}
+
+		isRoot := false
+		for _, m := range op.Exec.Mounts {
+			if m.Dest == pb.RootMount {
+				isRoot = true
+				break
+			}
+		}
+		if !isRoot {
+			return errors.Errorf("invalid exec op with no rootfs")
+		}
+	case *pb.Op_File:
+		if op.File == nil {
+			return errors.Errorf("invalid nil file op")
+		}
+		if len(op.File.Actions) == 0 {
+			return errors.Errorf("invalid file op with no actions")
+		}
+	case *pb.Op_Build:
+		if op.Build == nil {
+			return errors.Errorf("invalid nil build op")
+		}
+	}
+	return nil
+}
+
+func fileOpName(actions []*pb.FileAction) string {
+	names := make([]string, 0, len(actions))
+	for _, action := range actions {
+		switch a := action.Action.(type) {
+		case *pb.FileAction_Mkdir:
+			names = append(names, fmt.Sprintf("mkdir %s", a.Mkdir.Path))
+		case *pb.FileAction_Mkfile:
+			names = append(names, fmt.Sprintf("mkfile %s", a.Mkfile.Path))
+		case *pb.FileAction_Rm:
+			names = append(names, fmt.Sprintf("rm %s", a.Rm.Path))
+		case *pb.FileAction_Copy:
+			names = append(names, fmt.Sprintf("copy %s %s", a.Copy.Src, a.Copy.Dest))
+		}
+	}
+
+	return strings.Join(names, ", ")
 }

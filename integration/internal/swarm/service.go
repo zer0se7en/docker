@@ -9,8 +9,9 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
 	swarmtypes "github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/internal/test/daemon"
-	"github.com/docker/docker/internal/test/environment"
+	"github.com/docker/docker/client"
+	"github.com/docker/docker/testutil/daemon"
+	"github.com/docker/docker/testutil/environment"
 	"gotest.tools/assert"
 	"gotest.tools/poll"
 	"gotest.tools/skip"
@@ -48,7 +49,7 @@ func ContainerPoll(config *poll.Settings) {
 }
 
 // NewSwarm creates a swarm daemon for testing
-func NewSwarm(t *testing.T, testEnv *environment.Execution, ops ...func(*daemon.Daemon)) *daemon.Daemon {
+func NewSwarm(t *testing.T, testEnv *environment.Execution, ops ...daemon.Option) *daemon.Daemon {
 	t.Helper()
 	skip.If(t, testEnv.IsRemoteDaemon)
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
@@ -66,24 +67,27 @@ type ServiceSpecOpt func(*swarmtypes.ServiceSpec)
 // CreateService creates a service on the passed in swarm daemon.
 func CreateService(t *testing.T, d *daemon.Daemon, opts ...ServiceSpecOpt) string {
 	t.Helper()
-	spec := defaultServiceSpec()
-	for _, o := range opts {
-		o(&spec)
-	}
 
 	client := d.NewClientT(t)
 	defer client.Close()
 
+	spec := CreateServiceSpec(t, opts...)
 	resp, err := client.ServiceCreate(context.Background(), spec, types.ServiceCreateOptions{})
 	assert.NilError(t, err, "error creating service")
 	return resp.ID
 }
 
-func defaultServiceSpec() swarmtypes.ServiceSpec {
+// CreateServiceSpec creates a default service-spec, and applies the provided options
+func CreateServiceSpec(t *testing.T, opts ...ServiceSpecOpt) swarmtypes.ServiceSpec {
+	t.Helper()
 	var spec swarmtypes.ServiceSpec
 	ServiceWithImage("busybox:latest")(&spec)
 	ServiceWithCommand([]string{"/bin/top"})(&spec)
 	ServiceWithReplicas(1)(&spec)
+
+	for _, o := range opts {
+		o(&spec)
+	}
 	return spec
 }
 
@@ -138,6 +142,14 @@ func ServiceWithReplicas(n uint64) ServiceSpecOpt {
 	}
 }
 
+// ServiceWithMaxReplicas sets the max replicas for the service
+func ServiceWithMaxReplicas(n uint64) ServiceSpecOpt {
+	return func(spec *swarmtypes.ServiceSpec) {
+		ensurePlacement(spec)
+		spec.TaskTemplate.Placement.MaxReplicas = n
+	}
+}
+
 // ServiceWithName sets the name of the service
 func ServiceWithName(name string) ServiceSpecOpt {
 	return func(spec *swarmtypes.ServiceSpec) {
@@ -168,20 +180,25 @@ func ServiceWithSysctls(sysctls map[string]string) ServiceSpecOpt {
 	}
 }
 
-// GetRunningTasks gets the list of running tasks for a service
-func GetRunningTasks(t *testing.T, d *daemon.Daemon, serviceID string) []swarmtypes.Task {
-	t.Helper()
-	client := d.NewClientT(t)
-	defer client.Close()
-
-	filterArgs := filters.NewArgs()
-	filterArgs.Add("desired-state", "running")
-	filterArgs.Add("service", serviceID)
-
-	options := types.TaskListOptions{
-		Filters: filterArgs,
+// ServiceWithCapabilities sets the Capabilities option of the service's ContainerSpec.
+func ServiceWithCapabilities(Capabilities []string) ServiceSpecOpt {
+	return func(spec *swarmtypes.ServiceSpec) {
+		ensureContainerSpec(spec)
+		spec.TaskTemplate.ContainerSpec.Capabilities = Capabilities
 	}
-	tasks, err := client.TaskList(context.Background(), options)
+}
+
+// GetRunningTasks gets the list of running tasks for a service
+func GetRunningTasks(t *testing.T, c client.ServiceAPIClient, serviceID string) []swarmtypes.Task {
+	t.Helper()
+
+	tasks, err := c.TaskList(context.Background(), types.TaskListOptions{
+		Filters: filters.NewArgs(
+			filters.Arg("service", serviceID),
+			filters.Arg("desired-state", "running"),
+		),
+	})
+
 	assert.NilError(t, err)
 	return tasks
 }
@@ -205,5 +222,11 @@ func ExecTask(t *testing.T, d *daemon.Daemon, task swarmtypes.Task, config types
 func ensureContainerSpec(spec *swarmtypes.ServiceSpec) {
 	if spec.TaskTemplate.ContainerSpec == nil {
 		spec.TaskTemplate.ContainerSpec = &swarmtypes.ContainerSpec{}
+	}
+}
+
+func ensurePlacement(spec *swarmtypes.ServiceSpec) {
+	if spec.TaskTemplate.Placement == nil {
+		spec.TaskTemplate.Placement = &swarmtypes.Placement{}
 	}
 }

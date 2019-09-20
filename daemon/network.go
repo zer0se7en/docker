@@ -796,7 +796,7 @@ func buildCreateEndpointOptions(c *container.Container, n libnetwork.Network, ep
 
 	defaultNetName := runconfig.DefaultDaemonNetworkMode().NetworkName()
 
-	if (!c.EnableServiceDiscoveryOnDefaultNetwork() && n.Name() == defaultNetName) ||
+	if (!serviceDiscoveryOnDefaultNetwork() && n.Name() == defaultNetName) ||
 		c.NetworkSettings.IsAnonymousEndpoint {
 		createOptions = append(createOptions, libnetwork.CreateOptionAnonymous())
 	}
@@ -958,12 +958,6 @@ func buildCreateEndpointOptions(c *container.Container, n libnetwork.Network, ep
 		libnetwork.CreateOptionExposedPorts(exposeList))
 
 	return createOptions, nil
-}
-
-// getEndpointInNetwork returns the container's endpoint to the provided network.
-func getEndpointInNetwork(name string, n libnetwork.Network) (libnetwork.Endpoint, error) {
-	endpointName := strings.TrimPrefix(name, "/")
-	return n.EndpointByName(endpointName)
 }
 
 // getSandboxPortMapInfo retrieves the current port-mapping programmed for the given sandbox

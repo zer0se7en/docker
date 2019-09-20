@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/internal/test/request"
 	"gotest.tools/assert"
 	"gotest.tools/poll"
 	"gotest.tools/skip"
@@ -19,7 +18,7 @@ import (
 func TestStopContainerWithTimeout(t *testing.T) {
 	skip.If(t, testEnv.OSType == "windows")
 	defer setupTest(t)()
-	client := request.NewAPIClient(t)
+	client := testEnv.APIClient()
 	ctx := context.Background()
 
 	testCmd := container.WithCmd("sh", "-c", "sleep 2 && exit 42")
@@ -52,7 +51,7 @@ func TestStopContainerWithTimeout(t *testing.T) {
 		d := d
 		t.Run(strconv.Itoa(d.timeout), func(t *testing.T) {
 			t.Parallel()
-			id := container.Run(t, ctx, client, testCmd)
+			id := container.Run(ctx, t, client, testCmd)
 
 			timeout := time.Duration(d.timeout) * time.Second
 			err := client.ContainerStop(ctx, id, &timeout)

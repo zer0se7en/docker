@@ -2,9 +2,11 @@ package cache
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	"github.com/containerd/containerd/mount"
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/snapshot"
@@ -20,6 +22,7 @@ type Ref interface {
 	Release(context.Context) error
 	Size(ctx context.Context) (int64, error)
 	Metadata() *metadata.StorageItem
+	IdentityMapping() *idtools.IdentityMapping
 }
 
 type ImmutableRef interface {
@@ -48,7 +51,7 @@ type cacheRecord struct {
 
 	mutable bool
 	refs    map[ref]struct{}
-	parent  ImmutableRef
+	parent  *immutableRef
 	md      *metadata.StorageItem
 
 	// dead means record is marked as deleted
@@ -81,6 +84,10 @@ func (cr *cacheRecord) mref(triggerLastUsed bool) *mutableRef {
 // hold ref lock before calling
 func (cr *cacheRecord) isDead() bool {
 	return cr.dead || (cr.equalImmutable != nil && cr.equalImmutable.dead) || (cr.equalMutable != nil && cr.equalMutable.dead)
+}
+
+func (cr *cacheRecord) IdentityMapping() *idtools.IdentityMapping {
+	return cr.cm.IdentityMapping()
 }
 
 func (cr *cacheRecord) Size(ctx context.Context) (int64, error) {
@@ -120,14 +127,17 @@ func (cr *cacheRecord) Size(ctx context.Context) (int64, error) {
 }
 
 func (cr *cacheRecord) Parent() ImmutableRef {
-	return cr.parentRef(true)
+	if p := cr.parentRef(true); p != nil { // avoid returning typed nil pointer
+		return p
+	}
+	return nil
 }
 
-func (cr *cacheRecord) parentRef(hidden bool) ImmutableRef {
-	if cr.parent == nil {
+func (cr *cacheRecord) parentRef(hidden bool) *immutableRef {
+	p := cr.parent
+	if p == nil {
 		return nil
 	}
-	p := cr.parent.(*immutableRef)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.ref(hidden)
@@ -175,13 +185,13 @@ func (cr *cacheRecord) Mount(ctx context.Context, readonly bool) (snapshot.Mount
 func (cr *cacheRecord) remove(ctx context.Context, removeSnapshot bool) error {
 	delete(cr.cm.records, cr.ID())
 	if cr.parent != nil {
-		if err := cr.parent.(*immutableRef).release(ctx); err != nil {
+		if err := cr.parent.release(ctx); err != nil {
 			return err
 		}
 	}
 	if removeSnapshot {
 		if err := cr.cm.Snapshotter.Remove(ctx, cr.ID()); err != nil {
-			return err
+			return errors.Wrapf(err, "failed to remove %s", cr.ID())
 		}
 	}
 	if err := cr.cm.md.Clear(cr.ID()); err != nil {
@@ -250,7 +260,7 @@ func (sr *immutableRef) release(ctx context.Context) error {
 	if len(sr.refs) == 0 {
 		if sr.viewMount != nil { // TODO: release viewMount earlier if possible
 			if err := sr.cm.Snapshotter.Remove(ctx, sr.view); err != nil {
-				return err
+				return errors.Wrapf(err, "failed to remove view %s", sr.view)
 			}
 			sr.view = ""
 			sr.viewMount = nil
@@ -309,9 +319,9 @@ func (sr *mutableRef) updateLastUsed() bool {
 	return sr.triggerLastUsed
 }
 
-func (sr *mutableRef) commit(ctx context.Context) (ImmutableRef, error) {
+func (sr *mutableRef) commit(ctx context.Context) (*immutableRef, error) {
 	if !sr.mutable || len(sr.refs) == 0 {
-		return nil, errors.Wrapf(errInvalid, "invalid mutable ref")
+		return nil, errors.Wrapf(errInvalid, "invalid mutable ref %p", sr)
 	}
 
 	id := identity.NewID()
@@ -392,7 +402,7 @@ func (sr *mutableRef) release(ctx context.Context) error {
 			}
 		}
 		if sr.parent != nil {
-			if err := sr.parent.(*immutableRef).release(ctx); err != nil {
+			if err := sr.parent.release(ctx); err != nil {
 				return err
 			}
 		}
@@ -414,12 +424,16 @@ type readOnlyMounter struct {
 	snapshot.Mountable
 }
 
-func (m *readOnlyMounter) Mount() ([]mount.Mount, error) {
-	mounts, err := m.Mountable.Mount()
+func (m *readOnlyMounter) Mount() ([]mount.Mount, func() error, error) {
+	mounts, release, err := m.Mountable.Mount()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for i, m := range mounts {
+		if m.Type == "overlay" {
+			mounts[i].Options = readonlyOverlay(m.Options)
+			continue
+		}
 		opts := make([]string, 0, len(m.Options))
 		for _, opt := range m.Options {
 			if opt != "rw" {
@@ -429,5 +443,25 @@ func (m *readOnlyMounter) Mount() ([]mount.Mount, error) {
 		opts = append(opts, "ro")
 		mounts[i].Options = opts
 	}
-	return mounts, nil
+	return mounts, release, nil
+}
+
+func readonlyOverlay(opt []string) []string {
+	out := make([]string, 0, len(opt))
+	upper := ""
+	for _, o := range opt {
+		if strings.HasPrefix(o, "upperdir=") {
+			upper = strings.TrimPrefix(o, "upperdir=")
+		} else if !strings.HasPrefix(o, "workdir=") {
+			out = append(out, o)
+		}
+	}
+	if upper != "" {
+		for i, o := range out {
+			if strings.HasPrefix(o, "lowerdir=") {
+				out[i] = "lowerdir=" + upper + ":" + strings.TrimPrefix(o, "lowerdir=")
+			}
+		}
+	}
+	return out
 }

@@ -32,7 +32,7 @@ import (
 	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/parsers"
 	"github.com/docker/docker/pkg/system"
-	"github.com/docker/go-units"
+	units "github.com/docker/go-units"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -178,7 +178,7 @@ func (d *Driver) Cleanup() error {
 	}
 
 	if umountErr != nil {
-		return errors.Wrapf(umountErr, "error unmounting %s", d.home)
+		return umountErr
 	}
 
 	return nil

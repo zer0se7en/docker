@@ -10,7 +10,7 @@ import (
 	"github.com/docker/docker/pkg/progress"
 	refstore "github.com/docker/docker/reference"
 	"github.com/docker/docker/registry"
-	"github.com/opencontainers/go-digest"
+	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -39,12 +39,7 @@ func newPuller(endpoint registry.APIEndpoint, repoInfo *registry.RepositoryInfo,
 			repoInfo:          repoInfo,
 		}, nil
 	case registry.APIVersion1:
-		return &v1Puller{
-			v1IDService: metadata.NewV1IDService(imagePullConfig.MetadataStore),
-			endpoint:    endpoint,
-			config:      imagePullConfig,
-			repoInfo:    repoInfo,
-		}, nil
+		return nil, fmt.Errorf("protocol version %d no longer supported. Please contact admins of registry %s", endpoint.Version, endpoint.URL)
 	}
 	return nil, fmt.Errorf("unknown version %d for registry %s", endpoint.Version, endpoint.URL)
 }

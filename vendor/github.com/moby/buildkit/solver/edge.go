@@ -3,6 +3,7 @@ package solver
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/moby/buildkit/solver/internal/pipe"
 	digest "github.com/opencontainers/go-digest"
@@ -28,7 +29,7 @@ func newEdge(ed Edge, op activeOp, index *edgeIndex) *edge {
 		edge:         ed,
 		op:           op,
 		depRequests:  map[pipe.Receiver]*dep{},
-		keyMap:       map[string]*CacheKey{},
+		keyMap:       map[string]struct{}{},
 		cacheRecords: map[string]*CacheRecord{},
 		index:        index,
 	}
@@ -50,7 +51,7 @@ type edge struct {
 	execReq         pipe.Receiver
 	err             error
 	cacheRecords    map[string]*CacheRecord
-	keyMap          map[string]*CacheKey
+	keyMap          map[string]struct{}
 
 	noCacheMatchPossible      bool
 	allDepsCompletedCacheFast bool
@@ -330,7 +331,8 @@ func (e *edge) unpark(incoming []pipe.Sender, updates, allPipes []pipe.Receiver,
 	if e.cacheMapReq == nil && (e.cacheMap == nil || len(e.cacheRecords) == 0) {
 		index := e.cacheMapIndex
 		e.cacheMapReq = f.NewFuncRequest(func(ctx context.Context) (interface{}, error) {
-			return e.op.CacheMap(ctx, index)
+			cm, err := e.op.CacheMap(ctx, index)
+			return cm, errors.Wrap(err, "failed to load cache key")
 		})
 		cacheMapReq = true
 	}
@@ -526,6 +528,10 @@ func (e *edge) recalcCurrentState() {
 		}
 	}
 
+	for key := range newKeys {
+		e.keyMap[key] = struct{}{}
+	}
+
 	for _, r := range newKeys {
 		// TODO: add all deps automatically
 		mergedKey := r.clone()
@@ -612,6 +618,36 @@ func (e *edge) recalcCurrentState() {
 		e.allDepsCompletedCacheSlow = e.cacheMapDone && allDepsCompletedCacheSlow
 		e.allDepsStateCacheSlow = e.cacheMapDone && allDepsStateCacheSlow
 		e.allDepsCompleted = e.cacheMapDone && allDepsCompleted
+
+		if e.allDepsStateCacheSlow && len(e.cacheRecords) > 0 && e.state == edgeStatusCacheFast {
+			openKeys := map[string]struct{}{}
+			for _, dep := range e.deps {
+				isSlowIncomplete := e.slowCacheFunc(dep) != nil && (dep.state == edgeStatusCacheSlow || (dep.state == edgeStatusComplete && !dep.slowCacheComplete))
+				if !isSlowIncomplete {
+					openDepKeys := map[string]struct{}{}
+					for key := range dep.keyMap {
+						if _, ok := e.keyMap[key]; !ok {
+							openDepKeys[key] = struct{}{}
+						}
+					}
+					if len(openKeys) != 0 {
+						for k := range openKeys {
+							if _, ok := openDepKeys[k]; !ok {
+								delete(openKeys, k)
+							}
+						}
+					} else {
+						openKeys = openDepKeys
+					}
+					if len(openKeys) == 0 {
+						e.state = edgeStatusCacheSlow
+						if debugScheduler {
+							logrus.Debugf("upgrade to cache-slow because no open keys")
+						}
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -763,7 +799,8 @@ func (e *edge) createInputRequests(desiredState edgeStatusType, f *pipeFactory, 
 			res := dep.result
 			func(fn ResultBasedCacheFunc, res Result, index Index) {
 				dep.slowCacheReq = f.NewFuncRequest(func(ctx context.Context) (interface{}, error) {
-					return e.op.CalcSlowCache(ctx, index, fn, res)
+					v, err := e.op.CalcSlowCache(ctx, index, fn, res)
+					return v, errors.Wrap(err, "failed to compute cache key")
 				})
 			}(fn, res, dep.index)
 			addedNew = true
@@ -815,7 +852,7 @@ func (e *edge) loadCache(ctx context.Context) (interface{}, error) {
 	logrus.Debugf("load cache for %s with %s", e.edge.Vertex.Name(), rec.ID)
 	res, err := e.op.LoadCache(ctx, rec)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to load cache")
 	}
 
 	return NewCachedResult(res, []ExportableCacheKey{{CacheKey: rec.key, Exporter: &exporter{k: rec.key, record: rec, edge: e}}}), nil
@@ -826,7 +863,7 @@ func (e *edge) execOp(ctx context.Context) (interface{}, error) {
 	cacheKeys, inputs := e.commitOptions()
 	results, subExporters, err := e.op.Exec(ctx, toResultSlice(inputs))
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
 
 	index := e.edge.Index
@@ -845,7 +882,7 @@ func (e *edge) execOp(ctx context.Context) (interface{}, error) {
 	var exporters []CacheExporter
 
 	for _, cacheKey := range cacheKeys {
-		ck, err := e.op.Cache().Save(cacheKey, res)
+		ck, err := e.op.Cache().Save(cacheKey, res, time.Now())
 		if err != nil {
 			return nil, err
 		}

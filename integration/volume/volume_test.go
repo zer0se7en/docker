@@ -12,7 +12,7 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	volumetypes "github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/integration/internal/container"
-	"github.com/docker/docker/internal/test/request"
+	"github.com/docker/docker/testutil/request"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"gotest.tools/assert"
 	is "gotest.tools/assert/cmp"
@@ -20,12 +20,15 @@ import (
 )
 
 func TestVolumesCreateAndList(t *testing.T) {
-	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
 	defer setupTest(t)()
-	client := request.NewAPIClient(t)
+	client := testEnv.APIClient()
 	ctx := context.Background()
 
 	name := t.Name()
+	// Windows file system is case insensitive
+	if testEnv.OSType == "windows" {
+		name = strings.ToLower(name)
+	}
 	vol, err := client.VolumeCreate(ctx, volumetypes.VolumeCreateBody{
 		Name: name,
 	})
@@ -41,23 +44,31 @@ func TestVolumesCreateAndList(t *testing.T) {
 	}
 	assert.Check(t, is.DeepEqual(vol, expected, cmpopts.EquateEmpty()))
 
-	volumes, err := client.VolumeList(ctx, filters.Args{})
+	volList, err := client.VolumeList(ctx, filters.Args{})
 	assert.NilError(t, err)
+	assert.Assert(t, len(volList.Volumes) > 0)
 
-	assert.Check(t, is.Equal(len(volumes.Volumes), 1))
-	assert.Check(t, volumes.Volumes[0] != nil)
-	assert.Check(t, is.DeepEqual(*volumes.Volumes[0], expected, cmpopts.EquateEmpty()))
+	volumes := volList.Volumes[:0]
+	for _, v := range volList.Volumes {
+		if v.Name == vol.Name {
+			volumes = append(volumes, v)
+		}
+	}
+
+	assert.Check(t, is.Equal(len(volumes), 1))
+	assert.Check(t, volumes[0] != nil)
+	assert.Check(t, is.DeepEqual(*volumes[0], expected, cmpopts.EquateEmpty()))
 }
 
 func TestVolumesRemove(t *testing.T) {
 	skip.If(t, testEnv.OSType == "windows", "FIXME")
 	defer setupTest(t)()
-	client := request.NewAPIClient(t)
+	client := testEnv.APIClient()
 	ctx := context.Background()
 
 	prefix, slash := getPrefixAndSlashFromDaemonPlatform()
 
-	id := container.Create(t, ctx, client, container.WithVolume(prefix+slash+"foo"))
+	id := container.Create(ctx, t, client, container.WithVolume(prefix+slash+"foo"))
 
 	c, err := client.ContainerInspect(ctx, id)
 	assert.NilError(t, err)
@@ -76,9 +87,8 @@ func TestVolumesRemove(t *testing.T) {
 }
 
 func TestVolumesInspect(t *testing.T) {
-	skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
 	defer setupTest(t)()
-	client := request.NewAPIClient(t)
+	client := testEnv.APIClient()
 	ctx := context.Background()
 
 	now := time.Now()

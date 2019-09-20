@@ -23,7 +23,7 @@ import (
 	"github.com/docker/docker/distribution/metadata"
 	"github.com/docker/docker/distribution/xfer"
 	"github.com/docker/docker/image"
-	"github.com/docker/docker/image/v1"
+	v1 "github.com/docker/docker/image/v1"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/progress"
@@ -31,7 +31,7 @@ import (
 	"github.com/docker/docker/pkg/system"
 	refstore "github.com/docker/docker/reference"
 	"github.com/docker/docker/registry"
-	"github.com/opencontainers/go-digest"
+	digest "github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -200,7 +200,7 @@ func (ld *v2LayerDescriptor) Download(ctx context.Context, progressOutput progre
 	}
 
 	if offset != 0 {
-		_, err := layerDownload.Seek(offset, os.SEEK_SET)
+		_, err := layerDownload.Seek(offset, io.SeekStart)
 		if err != nil {
 			if err := ld.truncateDownloadFile(); err != nil {
 				return nil, 0, xfer.DoNotRetry{Err: err}
@@ -226,7 +226,7 @@ func (ld *v2LayerDescriptor) Download(ctx context.Context, progressOutput progre
 		// Restore the seek offset either at the beginning of the
 		// stream, or just after the last byte we have from previous
 		// attempts.
-		_, err = layerDownload.Seek(offset, os.SEEK_SET)
+		_, err = layerDownload.Seek(offset, io.SeekStart)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -272,7 +272,7 @@ func (ld *v2LayerDescriptor) Download(ctx context.Context, progressOutput progre
 
 	logrus.Debugf("Downloaded %s to tempfile %s", ld.ID(), tmpFile.Name())
 
-	_, err = tmpFile.Seek(0, os.SEEK_SET)
+	_, err = tmpFile.Seek(0, io.SeekStart)
 	if err != nil {
 		tmpFile.Close()
 		if err := os.Remove(tmpFile.Name()); err != nil {
@@ -310,7 +310,7 @@ func (ld *v2LayerDescriptor) truncateDownloadFile() error {
 	// Need a new hash context since we will be redoing the download
 	ld.verifier = nil
 
-	if _, err := ld.tmpFile.Seek(0, os.SEEK_SET); err != nil {
+	if _, err := ld.tmpFile.Seek(0, io.SeekStart); err != nil {
 		logrus.Errorf("error seeking to beginning of download file: %v", err)
 		return err
 	}
@@ -392,6 +392,15 @@ func (p *v2Puller) pullV2Tag(ctx context.Context, ref reference.Named, platform 
 		if p.config.RequireSchema2 {
 			return false, fmt.Errorf("invalid manifest: not schema2")
 		}
+
+		// give registries time to upgrade to schema2 and only warn if we know a registry has been upgraded long time ago
+		// TODO: condition to be removed
+		if reference.Domain(ref) == "docker.io" {
+			msg := fmt.Sprintf("Image %s uses outdated schema1 manifest format. Please upgrade to a schema2 image for better future compatibility. More information at https://docs.docker.com/registry/spec/deprecated-schema-v1/", ref)
+			logrus.Warn(msg)
+			progress.Message(p.config.ProgressOutput, "", msg)
+		}
+
 		id, manifestDigest, err = p.pullSchema1(ctx, ref, v, platform)
 		if err != nil {
 			return false, err
@@ -756,7 +765,7 @@ func (p *v2Puller) pullManifestList(ctx context.Context, ref reference.Named, mf
 	manifestMatches := filterManifests(mfstList.Manifests, platform)
 
 	if len(manifestMatches) == 0 {
-		errMsg := fmt.Sprintf("no matching manifest for %s in the manifest list entries", platforms.Format(platform))
+		errMsg := fmt.Sprintf("no matching manifest for %s in the manifest list entries", formatPlatform(platform))
 		logrus.Debugf(errMsg)
 		return "", "", errors.New(errMsg)
 	}
@@ -787,6 +796,10 @@ func (p *v2Puller) pullManifestList(ctx context.Context, ref reference.Named, mf
 
 	switch v := manifest.(type) {
 	case *schema1.SignedManifest:
+		msg := fmt.Sprintf("[DEPRECATION NOTICE] v2 schema1 manifests in manifest lists are not supported and will break in a future release. Suggest author of %s to upgrade to v2 schema2. More information at https://docs.docker.com/registry/spec/deprecated-schema-v1/", ref)
+		logrus.Warn(msg)
+		progress.Message(p.config.ProgressOutput, "", msg)
+
 		platform := toOCIPlatform(manifestMatches[0].Platform)
 		id, _, err = p.pullSchema1(ctx, manifestRef, v, &platform)
 		if err != nil {

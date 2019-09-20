@@ -18,10 +18,9 @@ import (
 const name = "journald"
 
 type journald struct {
-	mu      sync.Mutex
+	mu      sync.Mutex        //nolint:structcheck,unused
 	vars    map[string]string // additional variables and values to send to the journal along with the log message
 	readers map[*logger.LogWatcher]struct{}
-	closed  bool
 }
 
 func init() {
@@ -90,6 +89,7 @@ func validateLogOpt(cfg map[string]string) error {
 	for key := range cfg {
 		switch key {
 		case "labels":
+		case "labels-regex":
 		case "env":
 		case "env-regex":
 		case "tag":

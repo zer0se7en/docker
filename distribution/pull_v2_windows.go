@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
-	"os"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/containerd/containerd/platforms"
 	"github.com/docker/distribution"
 	"github.com/docker/distribution/manifest/manifestlist"
 	"github.com/docker/distribution/manifest/schema2"
@@ -40,7 +41,7 @@ func (ld *v2LayerDescriptor) open(ctx context.Context) (distribution.ReadSeekClo
 	// We're done if the registry has this blob.
 	if err == nil {
 		// Seek does an HTTP GET.  If it succeeds, the blob really is accessible.
-		if _, err = rsc.Seek(0, os.SEEK_SET); err == nil {
+		if _, err = rsc.Seek(0, io.SeekStart); err == nil {
 			return rsc, nil
 		}
 		rsc.Close()
@@ -52,7 +53,7 @@ func (ld *v2LayerDescriptor) open(ctx context.Context) (distribution.ReadSeekClo
 		rsc = transport.NewHTTPReadSeeker(http.DefaultClient, url, nil)
 
 		// Seek does an HTTP GET.  If it succeeds, the blob really is accessible.
-		_, err = rsc.Seek(0, os.SEEK_SET)
+		_, err = rsc.Seek(0, io.SeekStart)
 		if err == nil {
 			break
 		}
@@ -135,4 +136,11 @@ func checkImageCompatibility(imageOS, imageOSVersion string) error {
 		}
 	}
 	return nil
+}
+
+func formatPlatform(platform specs.Platform) string {
+	if platform.OS == "" {
+		platform = platforms.DefaultSpec()
+	}
+	return fmt.Sprintf("%s %s", platforms.Format(platform), system.GetOSVersion().ToString())
 }

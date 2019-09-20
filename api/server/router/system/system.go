@@ -2,7 +2,7 @@ package system // import "github.com/docker/docker/api/server/router/system"
 
 import (
 	"github.com/docker/docker/api/server/router"
-	"github.com/docker/docker/builder/builder-next"
+	buildkit "github.com/docker/docker/builder/builder-next"
 	"github.com/docker/docker/builder/fscache"
 )
 
@@ -30,6 +30,7 @@ func NewRouter(b Backend, c ClusterBackend, fscache *fscache.FSCache, builder *b
 	r.routes = []router.Route{
 		router.NewOptionsRoute("/{anyroute:.*}", optionsHandler),
 		router.NewGetRoute("/_ping", r.pingHandler),
+		router.NewHeadRoute("/_ping", r.pingHandler),
 		router.NewGetRoute("/events", r.getEvents),
 		router.NewGetRoute("/info", r.getInfo),
 		router.NewGetRoute("/version", r.getVersion),

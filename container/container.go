@@ -36,7 +36,7 @@ import (
 	"github.com/docker/docker/restartmanager"
 	"github.com/docker/docker/volume"
 	volumemounts "github.com/docker/docker/volume/mounts"
-	"github.com/docker/go-units"
+	units "github.com/docker/go-units"
 	agentexec "github.com/docker/swarmkit/agent/exec"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -730,7 +730,7 @@ func (i *rio) Close() error {
 }
 
 func (i *rio) Wait() {
-	i.sc.Wait()
+	i.sc.Wait(context.Background())
 
 	i.IO.Wait()
 }

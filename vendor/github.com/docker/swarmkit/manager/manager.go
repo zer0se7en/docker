@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -758,6 +759,7 @@ func (m *Manager) updateKEK(ctx context.Context, cluster *api.Cluster) error {
 					func(addr string, timeout time.Duration) (net.Conn, error) {
 						return xnet.DialTimeoutLocal(addr, timeout)
 					}),
+				grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32)),
 			)
 			if err != nil {
 				logger.WithError(err).Error("failed to connect to local manager socket after locking the cluster")
@@ -1010,10 +1012,16 @@ func (m *Manager) becomeLeader(ctx context.Context) {
 			cluster = store.GetCluster(tx, clusterID)
 		})
 		if cluster.DefaultAddressPool != nil {
+			if m.config.NetworkConfig == nil {
+				m.config.NetworkConfig = &cnmallocator.NetworkConfig{}
+			}
 			m.config.NetworkConfig.DefaultAddrPool = append(m.config.NetworkConfig.DefaultAddrPool, cluster.DefaultAddressPool...)
 			m.config.NetworkConfig.SubnetSize = cluster.SubnetSize
 		}
 		if cluster.VXLANUDPPort != 0 {
+			if m.config.NetworkConfig == nil {
+				m.config.NetworkConfig = &cnmallocator.NetworkConfig{}
+			}
 			m.config.NetworkConfig.VXLANUDPPort = cluster.VXLANUDPPort
 		}
 	}

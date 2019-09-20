@@ -232,7 +232,7 @@ func overlayInfo(info, overlay snapshots.Info) snapshots.Info {
 		info.Labels = overlay.Labels
 	} else {
 		for k, v := range overlay.Labels {
-			overlay.Labels[k] = v
+			info.Labels[k] = v
 		}
 	}
 	return info
@@ -628,7 +628,7 @@ func (s *snapshotter) garbageCollect(ctx context.Context) (d time.Duration, err 
 			}
 		}
 		if err == nil {
-			d = time.Now().Sub(t1)
+			d = time.Since(t1)
 		}
 	}()
 

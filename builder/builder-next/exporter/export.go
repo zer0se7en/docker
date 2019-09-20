@@ -117,12 +117,12 @@ func (e *imageExporterInstance) Export(ctx context.Context, inp exporter.Source)
 		layersDone := oneOffProgress(ctx, "exporting layers")
 
 		if err := ref.Finalize(ctx, true); err != nil {
-			return nil, err
+			return nil, layersDone(err)
 		}
 
 		diffIDs, err := e.opt.Differ.EnsureLayer(ctx, ref.ID())
 		if err != nil {
-			return nil, err
+			return nil, layersDone(err)
 		}
 
 		diffs = make([]digest.Digest, len(diffIDs))
@@ -130,7 +130,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, inp exporter.Source)
 			diffs[i] = digest.Digest(diffIDs[i])
 		}
 
-		layersDone(nil)
+		_ = layersDone(nil)
 	}
 
 	if len(config) == 0 {
@@ -148,7 +148,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, inp exporter.Source)
 
 	diffs, history = normalizeLayersAndHistory(diffs, history, ref)
 
-	config, err = patchImageConfig(config, diffs, history)
+	config, err = patchImageConfig(config, diffs, history, inp.Metadata[exptypes.ExporterInlineCache])
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +160,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, inp exporter.Source)
 	if err != nil {
 		return nil, configDone(err)
 	}
-	configDone(nil)
+	_ = configDone(nil)
 
 	if e.opt.ReferenceStore != nil {
 		for _, targetName := range e.targetNames {
@@ -169,7 +169,7 @@ func (e *imageExporterInstance) Export(ctx context.Context, inp exporter.Source)
 			if err := e.opt.ReferenceStore.AddTag(targetName, digest.Digest(id), true); err != nil {
 				return nil, tagDone(err)
 			}
-			tagDone(nil)
+			_ = tagDone(nil)
 		}
 	}
 
