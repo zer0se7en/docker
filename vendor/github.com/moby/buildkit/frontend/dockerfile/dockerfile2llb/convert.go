@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/url"
 	"path"
 	"path/filepath"
@@ -640,9 +641,20 @@ func dispatchRun(d *dispatchState, c *instructions.RunCommand, proxy *llb.ProxyE
 	}
 	opt = append(opt, runMounts...)
 
-	err = dispatchRunSecurity(d, c)
+	securityOpt, err := dispatchRunSecurity(c)
 	if err != nil {
 		return err
+	}
+	if securityOpt != nil {
+		opt = append(opt, securityOpt)
+	}
+
+	networkOpt, err := dispatchRunNetwork(c)
+	if err != nil {
+		return err
+	}
+	if networkOpt != nil {
+		opt = append(opt, networkOpt)
 	}
 
 	shlex := *dopt.shlex
@@ -1314,7 +1326,7 @@ func prefixCommand(ds *dispatchState, str string, prefixPlatform bool, platform 
 		out += ds.stageName + " "
 	}
 	ds.cmdIndex++
-	out += fmt.Sprintf("%d/%d] ", ds.cmdIndex, ds.cmdTotal)
+	out += fmt.Sprintf("%*d/%d] ", int(1+math.Log10(float64(ds.cmdTotal))), ds.cmdIndex, ds.cmdTotal)
 	return out + str
 }
 

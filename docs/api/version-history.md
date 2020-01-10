@@ -31,6 +31,9 @@ keywords: "API, Docker, rcli, REST, documentation"
 * `GET /info` now  returns an `OSVersion` field, containing the operating system's
   version. This change is not versioned, and affects all API versions if the daemon
   has this patch.
+* `GET /services` now accepts query parameter `status`. When set `true`,
+  services returned will include `ServiceStatus`, which provides Desired and
+  Running task counts for the service.
 
 ## v1.40 API changes
 
@@ -106,6 +109,9 @@ keywords: "API, Docker, rcli, REST, documentation"
 * `POST /swarm/init` now accepts a `DefaultAddrPool` property to set global scope default address pool
 * `POST /swarm/init` now accepts a `SubnetSize` property to set global scope networks by giving the
   length of the subnet masks for every such network
+* `POST /session` (added in [V1.31](#v131-api-changes) is no longer experimental.
+  This endpoint can be used to run interactive long-running protocols between the
+  client and the daemon.
 
 ## V1.38 API changes
 
@@ -263,7 +269,7 @@ keywords: "API, Docker, rcli, REST, documentation"
 * `GET /containers/create` now takes a `DeviceCgroupRules` field in `HostConfig` allowing to set custom device cgroup rules for the created container.
 * Optional query parameter `verbose` for `GET /networks/(id or name)` will now list all services with all the tasks, including the non-local tasks on the given network.
 * `GET /containers/(id or name)/attach/ws` now returns WebSocket in binary frame format for API version >= v1.28, and returns WebSocket in text frame format for API version< v1.28, for the purpose of backward-compatibility.
-* `GET /networks` is optimised only to return list of all networks and network specific information. List of all containers attached to a specific network is removed from this API and is only available using the network specific `GET /networks/{network-id}.
+* `GET /networks` is optimised only to return list of all networks and network specific information. List of all containers attached to a specific network is removed from this API and is only available using the network specific `GET /networks/{network-id}`.
 * `GET /containers/json` now supports `publish` and `expose` filters to filter containers that expose or publish certain ports.
 * `POST /services/create` and `POST /services/(id or name)/update` now accept the `ReadOnly` parameter, which mounts the container's root filesystem as read only.
 * `POST /build` now accepts `extrahosts` parameter to specify a host to ip mapping to use during the build.

@@ -154,7 +154,7 @@ func (daemon *Daemon) newContainer(name string, operatingSystem string, config *
 	base.Created = time.Now().UTC()
 	base.Managed = managed
 	base.Path = entrypoint
-	base.Args = args //FIXME: de-duplicate from config
+	base.Args = args // FIXME: de-duplicate from config
 	base.Config = config
 	base.HostConfig = &containertypes.HostConfig{}
 	base.ImageID = imgID
@@ -275,6 +275,7 @@ func validateHostConfig(hostConfig *containertypes.HostConfig, platform string) 
 	if hostConfig == nil {
 		return nil
 	}
+
 	if hostConfig.AutoRemove && !hostConfig.RestartPolicy.IsNone() {
 		return errors.Errorf("can't create 'AutoRemove' container with restart policy")
 	}

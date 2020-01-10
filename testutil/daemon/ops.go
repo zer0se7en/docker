@@ -1,9 +1,21 @@
 package daemon
 
-import "github.com/docker/docker/testutil/environment"
+import (
+	"github.com/docker/docker/testutil/environment"
+)
 
 // Option is used to configure a daemon.
 type Option func(*Daemon)
+
+// WithContainerdSocket sets the --containerd option on the daemon.
+// Use an empty string to remove the option.
+//
+// If unset the --containerd option will be used with a default value.
+func WithContainerdSocket(socket string) Option {
+	return func(d *Daemon) {
+		d.containerdSocket = socket
+	}
+}
 
 // WithDefaultCgroupNamespaceMode sets the default cgroup namespace mode for the daemon
 func WithDefaultCgroupNamespaceMode(mode string) Option {
@@ -12,15 +24,25 @@ func WithDefaultCgroupNamespaceMode(mode string) Option {
 	}
 }
 
+// WithTestLogger causes the daemon to log certain actions to the provided test.
+func WithTestLogger(t LogT) Option {
+	return func(d *Daemon) {
+		d.log = t
+	}
+}
+
 // WithExperimental sets the daemon in experimental mode
-func WithExperimental(d *Daemon) {
-	d.experimental = true
-	d.init = true
+func WithExperimental() Option {
+	return func(d *Daemon) {
+		d.experimental = true
+	}
 }
 
 // WithInit sets the daemon init
-func WithInit(d *Daemon) {
-	d.init = true
+func WithInit() Option {
+	return func(d *Daemon) {
+		d.init = true
+	}
 }
 
 // WithDockerdBinary sets the dockerd binary to the specified one
@@ -75,7 +97,7 @@ func WithEnvironment(e environment.Execution) Option {
 }
 
 // WithStorageDriver sets store driver option
-func WithStorageDriver(driver string) func(d *Daemon) {
+func WithStorageDriver(driver string) Option {
 	return func(d *Daemon) {
 		d.storageDriver = driver
 	}

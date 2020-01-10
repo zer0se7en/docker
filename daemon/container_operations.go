@@ -200,7 +200,14 @@ func (daemon *Daemon) buildSandboxOptions(container *container.Container) ([]lib
 		if alias != child.Name[1:] {
 			aliasList = aliasList + " " + child.Name[1:]
 		}
-		sboxOptions = append(sboxOptions, libnetwork.OptionExtraHost(aliasList, child.NetworkSettings.Networks[defaultNetName].IPAddress))
+		ipv4 := child.NetworkSettings.Networks[defaultNetName].IPAddress
+		ipv6 := child.NetworkSettings.Networks[defaultNetName].GlobalIPv6Address
+		if ipv4 != "" {
+			sboxOptions = append(sboxOptions, libnetwork.OptionExtraHost(aliasList, ipv4))
+		}
+		if ipv6 != "" {
+			sboxOptions = append(sboxOptions, libnetwork.OptionExtraHost(aliasList, ipv6))
+		}
 		cEndpointID = child.NetworkSettings.Networks[defaultNetName].EndpointID
 		if cEndpointID != "" {
 			childEndpoints = append(childEndpoints, cEndpointID)
@@ -777,9 +784,8 @@ func (daemon *Daemon) connectToNetwork(container *container.Container, idOrName 
 		EndpointSettings: endpointConfig,
 		IPAMOperational:  operIPAM,
 	}
-	if _, ok := container.NetworkSettings.Networks[n.ID()]; ok {
-		delete(container.NetworkSettings.Networks, n.ID())
-	}
+
+	delete(container.NetworkSettings.Networks, n.ID())
 
 	if err := daemon.updateEndpointNetworkSettings(container, n, ep); err != nil {
 		return err

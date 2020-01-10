@@ -7,25 +7,23 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"testing"
 
-	"github.com/docker/docker/testutil"
 	"golang.org/x/sys/unix"
 	"gotest.tools/assert"
 )
 
-func cleanupNetworkNamespace(t testingT, execRoot string) {
-	if ht, ok := t.(testutil.HelperT); ok {
-		ht.Helper()
-	}
+func cleanupNetworkNamespace(t testing.TB, d *Daemon) {
+	t.Helper()
 	// Cleanup network namespaces in the exec root of this
 	// daemon because this exec root is specific to this
 	// daemon instance and has no chance of getting
 	// cleaned up when a new daemon is instantiated with a
 	// new exec root.
-	netnsPath := filepath.Join(execRoot, "netns")
+	netnsPath := filepath.Join(d.execRoot, "netns")
 	filepath.Walk(netnsPath, func(path string, info os.FileInfo, err error) error {
 		if err := unix.Unmount(path, unix.MNT_DETACH); err != nil && err != unix.EINVAL && err != unix.ENOENT {
-			t.Logf("unmount of %s failed: %v", path, err)
+			t.Logf("[%s] unmount of %s failed: %v", d.id, path, err)
 		}
 		os.Remove(path)
 		return nil
@@ -33,7 +31,7 @@ func cleanupNetworkNamespace(t testingT, execRoot string) {
 }
 
 // CgroupNamespace returns the cgroup namespace the daemon is running in
-func (d *Daemon) CgroupNamespace(t assert.TestingT) string {
+func (d *Daemon) CgroupNamespace(t testing.TB) string {
 	link, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/cgroup", d.Pid()))
 	assert.NilError(t, err)
 

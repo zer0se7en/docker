@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	containerd_cgroups "github.com/containerd/cgroups"
+	statsV1 "github.com/containerd/cgroups/stats/v1"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/blkiodev"
 	pblkiodev "github.com/docker/docker/api/types/blkiodev"
@@ -53,6 +53,8 @@ import (
 )
 
 const (
+	isWindows = false
+
 	// DefaultShimBinary is the default shim to be used by containerd if none
 	// is specified
 	DefaultShimBinary = "containerd-shim"
@@ -362,10 +364,15 @@ func (daemon *Daemon) adaptContainerSettings(hostConfig *containertypes.HostConf
 
 	// Set default cgroup namespace mode, if unset for container
 	if hostConfig.CgroupnsMode.IsEmpty() {
-		if hostConfig.Privileged {
+		// for cgroup v2: unshare cgroupns even for privileged containers
+		// https://github.com/containers/libpod/pull/4374#issuecomment-549776387
+		if hostConfig.Privileged && !cgroups.IsCgroup2UnifiedMode() {
 			hostConfig.CgroupnsMode = containertypes.CgroupnsMode("host")
 		} else {
-			m := config.DefaultCgroupNamespaceMode
+			m := "host"
+			if cgroups.IsCgroup2UnifiedMode() {
+				m = "private"
+			}
 			if daemon.configStore != nil {
 				m = daemon.configStore.CgroupNamespaceMode
 			}
@@ -706,8 +713,8 @@ func verifyPlatformContainerSettings(daemon *Daemon, hostConfig *containertypes.
 			warnings = append(warnings, "Your kernel does not support cgroup namespaces.  Cgroup namespace setting discarded.")
 		}
 
-		if hostConfig.Privileged {
-			return warnings, fmt.Errorf("privileged mode is incompatible with private cgroup namespaces.  You must run the container in the host cgroup namespace when running privileged mode")
+		if hostConfig.Privileged && !cgroups.IsCgroup2UnifiedMode() {
+			return warnings, fmt.Errorf("privileged mode is incompatible with private cgroup namespaces on cgroup v1 host.  You must run the container in the host cgroup namespace when running privileged mode")
 		}
 	}
 
@@ -1201,11 +1208,32 @@ func setupRemappedRoot(config *config.Config) (*idtools.IdentityMapping, error) 
 		// update remapped root setting now that we have resolved them to actual names
 		config.RemappedRoot = fmt.Sprintf("%s:%s", username, groupname)
 
+		// try with username:groupname, uid:groupname, username:gid, uid:gid,
+		// but keep the original error message (err)
 		mappings, err := idtools.NewIdentityMapping(username, groupname)
-		if err != nil {
+		if err == nil {
+			return mappings, nil
+		}
+		user, lookupErr := idtools.LookupUser(username)
+		if lookupErr != nil {
 			return nil, errors.Wrap(err, "Can't create ID mappings")
 		}
-		return mappings, nil
+		logrus.Infof("Can't create ID mappings with username:groupname %s:%s, try uid:groupname %d:%s", username, groupname, user.Uid, groupname)
+		mappings, lookupErr = idtools.NewIdentityMapping(fmt.Sprintf("%d", user.Uid), groupname)
+		if lookupErr == nil {
+			return mappings, nil
+		}
+		logrus.Infof("Can't create ID mappings with uid:groupname %d:%s, try username:gid %s:%d", user.Uid, groupname, username, user.Gid)
+		mappings, lookupErr = idtools.NewIdentityMapping(username, fmt.Sprintf("%d", user.Gid))
+		if lookupErr == nil {
+			return mappings, nil
+		}
+		logrus.Infof("Can't create ID mappings with username:gid %s:%d, try uid:gid %d:%d", username, user.Gid, user.Uid, user.Gid)
+		mappings, lookupErr = idtools.NewIdentityMapping(fmt.Sprintf("%d", user.Uid), fmt.Sprintf("%d", user.Gid))
+		if lookupErr == nil {
+			return mappings, nil
+		}
+		return nil, errors.Wrap(err, "Can't create ID mappings")
 	}
 	return &idtools.IdentityMapping{}, nil
 }
@@ -1374,7 +1402,7 @@ func (daemon *Daemon) conditionalUnmountOnCleanup(container *container.Container
 	return daemon.Unmount(container)
 }
 
-func copyBlkioEntry(entries []*containerd_cgroups.BlkIOEntry) []types.BlkioStatEntry {
+func copyBlkioEntry(entries []*statsV1.BlkIOEntry) []types.BlkioStatEntry {
 	out := make([]types.BlkioStatEntry, len(entries))
 	for i, re := range entries {
 		out[i] = types.BlkioStatEntry{
@@ -1571,6 +1599,10 @@ func (daemon *Daemon) initCgroupsPath(path string) error {
 		return nil
 	}
 
+	if cgroups.IsCgroup2UnifiedMode() {
+		return fmt.Errorf("daemon-scoped cpu-rt-period and cpu-rt-runtime are not implemented for cgroup v2")
+	}
+
 	// Recursively create cgroup to ensure that the system and all parent cgroups have values set
 	// for the period and runtime as this limits what the children can be set to.
 	daemon.initCgroupsPath(filepath.Dir(path))
@@ -1615,4 +1647,8 @@ func (daemon *Daemon) setupSeccompProfile() error {
 		daemon.seccompProfile = b
 	}
 	return nil
+}
+
+func (daemon *Daemon) useShimV2() bool {
+	return cgroups.IsCgroup2UnifiedMode()
 }

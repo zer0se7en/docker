@@ -151,6 +151,11 @@ func (w *Worker) GCPolicy() []client.PruneInfo {
 	return w.Opt.GCPolicy
 }
 
+// ContentStore returns content store
+func (w *Worker) ContentStore() content.Store {
+	return w.Opt.ContentStore
+}
+
 // LoadRef loads a reference by ID
 func (w *Worker) LoadRef(id string, hidden bool) (cache.ImmutableRef, error) {
 	var opts []cache.RefOption
@@ -300,6 +305,23 @@ func (w *Worker) PruneCacheMounts(ctx context.Context, ids []string) error {
 	return nil
 }
 
+func (w *Worker) getRef(ctx context.Context, diffIDs []layer.DiffID, opts ...cache.RefOption) (cache.ImmutableRef, error) {
+	var parent cache.ImmutableRef
+	if len(diffIDs) > 1 {
+		var err error
+		parent, err = w.getRef(ctx, diffIDs[:len(diffIDs)-1], opts...)
+		if err != nil {
+			return nil, err
+		}
+		defer parent.Release(context.TODO())
+	}
+	return w.CacheManager.GetByBlob(context.TODO(), ocispec.Descriptor{
+		Annotations: map[string]string{
+			"containerd.io/uncompressed": diffIDs[len(diffIDs)-1].String(),
+		},
+	}, parent, opts...)
+}
+
 // FromRemote converts a remote snapshot reference to a local one
 func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (cache.ImmutableRef, error) {
 	rootfs, err := getLayers(ctx, remote.Descriptors)
@@ -322,7 +344,7 @@ func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (cache.I
 
 	defer func() {
 		for _, l := range rootfs {
-			w.ContentStore.Delete(context.TODO(), l.Blob.Digest)
+			w.ContentStore().Delete(context.TODO(), l.Blob.Digest)
 		}
 	}()
 
@@ -348,7 +370,7 @@ func (w *Worker) FromRemote(ctx context.Context, remote *solver.Remote) (cache.I
 		if v, ok := remote.Descriptors[i].Annotations["buildkit/description"]; ok {
 			descr = v
 		}
-		ref, err := w.CacheManager.GetFromSnapshotter(ctx, string(layer.CreateChainID(rootFS.DiffIDs[:i+1])), cache.WithDescription(descr), cache.WithCreationTime(tm))
+		ref, err := w.getRef(ctx, rootFS.DiffIDs[:i+1], cache.WithDescription(descr), cache.WithCreationTime(tm))
 		if err != nil {
 			return nil, err
 		}
@@ -391,12 +413,12 @@ func (ld *layerDescriptor) DiffID() (layer.DiffID, error) {
 
 func (ld *layerDescriptor) Download(ctx context.Context, progressOutput pkgprogress.Output) (io.ReadCloser, int64, error) {
 	done := oneOffProgress(ld.pctx, fmt.Sprintf("pulling %s", ld.desc.Digest))
-	if err := contentutil.Copy(ctx, ld.w.ContentStore, ld.provider, ld.desc); err != nil {
+	if err := contentutil.Copy(ctx, ld.w.ContentStore(), ld.provider, ld.desc); err != nil {
 		return nil, 0, done(err)
 	}
 	_ = done(nil)
 
-	ra, err := ld.w.ContentStore.ReaderAt(ctx, ld.desc)
+	ra, err := ld.w.ContentStore().ReaderAt(ctx, ld.desc)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -405,7 +427,7 @@ func (ld *layerDescriptor) Download(ctx context.Context, progressOutput pkgprogr
 }
 
 func (ld *layerDescriptor) Close() {
-	// ld.is.ContentStore.Delete(context.TODO(), ld.desc.Digest)
+	// ld.is.ContentStore().Delete(context.TODO(), ld.desc.Digest)
 }
 
 func (ld *layerDescriptor) Registered(diffID layer.DiffID) {

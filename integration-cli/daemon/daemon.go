@@ -12,16 +12,6 @@ import (
 	"gotest.tools/icmd"
 )
 
-type testingT interface {
-	assert.TestingT
-	logT
-	Fatalf(string, ...interface{})
-}
-
-type logT interface {
-	Logf(string, ...interface{})
-}
-
 // Daemon represents a Docker daemon for the testing framework.
 type Daemon struct {
 	*daemon.Daemon
@@ -31,7 +21,8 @@ type Daemon struct {
 // New returns a Daemon instance to be used for testing.
 // This will create a directory such as d123456789 in the folder specified by $DOCKER_INTEGRATION_DAEMON_DEST or $DEST.
 // The daemon will not automatically start.
-func New(t testingT, dockerBinary string, dockerdBinary string, ops ...daemon.Option) *Daemon {
+func New(t testing.TB, dockerBinary string, dockerdBinary string, ops ...daemon.Option) *Daemon {
+	t.Helper()
 	ops = append(ops, daemon.WithDockerdBinary(dockerdBinary))
 	d := daemon.New(t, ops...)
 	return &Daemon{
@@ -88,9 +79,10 @@ func (d *Daemon) inspectFieldWithError(name, field string) (string, error) {
 
 // CheckActiveContainerCount returns the number of active containers
 // FIXME(vdemeester) should re-use ActivateContainers in some way
-func (d *Daemon) CheckActiveContainerCount(c *testing.T) (interface{}, string) {
+func (d *Daemon) CheckActiveContainerCount(t *testing.T) (interface{}, string) {
+	t.Helper()
 	out, err := d.Cmd("ps", "-q")
-	assert.NilError(c, err)
+	assert.NilError(t, err)
 	if len(strings.TrimSpace(out)) == 0 {
 		return 0, ""
 	}

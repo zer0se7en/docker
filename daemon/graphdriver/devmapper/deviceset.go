@@ -119,7 +119,7 @@ type DeviceSet struct {
 	deletionWorkerTicker  *time.Ticker
 	uidMaps               []idtools.IDMap
 	gidMaps               []idtools.IDMap
-	minFreeSpacePercent   uint32 //min free space percentage in thinpool
+	minFreeSpacePercent   uint32 // min free space percentage in thinpool
 	xfsNospaceRetries     string // max retries when xfs receives ENOSPC
 	lvmSetupConfig        directLVMConfig
 }
@@ -540,8 +540,14 @@ func xfsSupported() error {
 		return err // error text is descriptive enough
 	}
 
-	// Check if kernel supports xfs filesystem or not.
-	exec.Command("modprobe", "xfs").Run()
+	mountTarget, err := ioutil.TempDir("", "supportsXFS")
+	if err != nil {
+		return errors.Wrapf(err, "error checking for xfs support")
+	}
+
+	/* The mounting will fail--after the module has been loaded.*/
+	defer os.RemoveAll(mountTarget)
+	unix.Mount("none", mountTarget, "xfs", 0, "")
 
 	f, err := os.Open("/proc/filesystems")
 	if err != nil {
@@ -1686,8 +1692,8 @@ func (devices *DeviceSet) initDevmapper(doInit bool) (retErr error) {
 		}
 	}
 
-	//create the root dir of the devmapper driver ownership to match this
-	//daemon's remapped root uid/gid so containers can start properly
+	// create the root dir of the devmapper driver ownership to match this
+	// daemon's remapped root uid/gid so containers can start properly
 	uid, gid, err := idtools.GetRootUIDGID(devices.uidMaps, devices.gidMaps)
 	if err != nil {
 		return err

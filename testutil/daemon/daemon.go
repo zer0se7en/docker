@@ -11,16 +11,16 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/client"
-	"github.com/docker/docker/daemon/images"
 	"github.com/docker/docker/opts"
 	"github.com/docker/docker/pkg/ioutils"
+	"github.com/docker/docker/pkg/mount"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/testutil"
 	"github.com/docker/docker/testutil/request"
 	"github.com/docker/go-connections/sockets"
 	"github.com/docker/go-connections/tlsconfig"
@@ -28,25 +28,21 @@ import (
 	"gotest.tools/assert"
 )
 
-type testingT interface {
-	assert.TestingT
-	logT
-	Fatalf(string, ...interface{})
-}
-
-type namer interface {
-	Name() string
-}
-type testNamer interface {
-	TestName() string
-}
-
-type logT interface {
+// LogT is the subset of the testing.TB interface used by the daemon.
+type LogT interface {
 	Logf(string, ...interface{})
 }
 
-const defaultDockerdBinary = "dockerd"
-const containerdSocket = "/var/run/docker/containerd/containerd.sock"
+// nopLog is a no-op implementation of LogT that is used in daemons created by
+// NewDaemon (where no testing.TB is available).
+type nopLog struct{}
+
+func (nopLog) Logf(string, ...interface{}) {}
+
+const (
+	defaultDockerdBinary    = "dockerd"
+	defaultContainerdSocket = "/var/run/docker/containerd/containerd.sock"
+)
 
 var errDaemonNotStarted = errors.New("daemon not started")
 
@@ -61,7 +57,6 @@ type clientConfig struct {
 
 // Daemon represents a Docker daemon for the testing framework
 type Daemon struct {
-	GlobalFlags       []string
 	Root              string
 	Folder            string
 	Wait              chan error
@@ -78,8 +73,10 @@ type Daemon struct {
 	experimental               bool
 	init                       bool
 	dockerdBinary              string
-	log                        logT
-	imageService               *images.ImageService
+	log                        LogT
+	pidFile                    string
+	args                       []string
+	containerdSocket           string
 
 	// swarm related field
 	swarmListenAddr string
@@ -91,37 +88,26 @@ type Daemon struct {
 	CachedInfo types.Info
 }
 
-// New returns a Daemon instance to be used for testing.
-// This will create a directory such as d123456789 in the folder specified by $DOCKER_INTEGRATION_DAEMON_DEST or $DEST.
+// NewDaemon returns a Daemon instance to be used for testing.
 // The daemon will not automatically start.
-func New(t testingT, ops ...Option) *Daemon {
-	if ht, ok := t.(testutil.HelperT); ok {
-		ht.Helper()
-	}
-	dest := os.Getenv("DOCKER_INTEGRATION_DAEMON_DEST")
-	if dest == "" {
-		dest = os.Getenv("DEST")
-	}
-	switch v := t.(type) {
-	case namer:
-		dest = filepath.Join(dest, v.Name())
-	case testNamer:
-		dest = filepath.Join(dest, v.TestName())
-	}
-	t.Logf("Creating a new daemon at: %s", dest)
-	assert.Check(t, dest != "", "Please set the DOCKER_INTEGRATION_DAEMON_DEST or the DEST environment variable")
-
+// The daemon will modify and create files under workingDir.
+func NewDaemon(workingDir string, ops ...Option) (*Daemon, error) {
 	storageDriver := os.Getenv("DOCKER_GRAPHDRIVER")
 
-	assert.NilError(t, os.MkdirAll(SockRoot, 0700), "could not create daemon socket root")
+	if err := os.MkdirAll(SockRoot, 0700); err != nil {
+		return nil, errors.Wrapf(err, "failed to create daemon socket root %q", SockRoot)
+	}
 
 	id := fmt.Sprintf("d%s", stringid.TruncateID(stringid.GenerateRandomID()))
-	dir := filepath.Join(dest, id)
+	dir := filepath.Join(workingDir, id)
 	daemonFolder, err := filepath.Abs(dir)
-	assert.NilError(t, err, "Could not make %q an absolute path", dir)
+	if err != nil {
+		return nil, err
+	}
 	daemonRoot := filepath.Join(daemonFolder, "root")
-
-	assert.NilError(t, os.MkdirAll(daemonRoot, 0755), "Could not create daemon root %q", dir)
+	if err := os.MkdirAll(daemonRoot, 0755); err != nil {
+		return nil, errors.Wrapf(err, "failed to create daemon root %q", daemonRoot)
+	}
 
 	userlandProxy := true
 	if env := os.Getenv("DOCKER_USERLANDPROXY"); env != "" {
@@ -136,16 +122,37 @@ func New(t testingT, ops ...Option) *Daemon {
 		storageDriver: storageDriver,
 		userlandProxy: userlandProxy,
 		// dxr stands for docker-execroot (shortened for avoiding unix(7) path length limitation)
-		execRoot:        filepath.Join(os.TempDir(), "dxr", id),
-		dockerdBinary:   defaultDockerdBinary,
-		swarmListenAddr: defaultSwarmListenAddr,
-		SwarmPort:       DefaultSwarmPort,
-		log:             t,
+		execRoot:         filepath.Join(os.TempDir(), "dxr", id),
+		dockerdBinary:    defaultDockerdBinary,
+		swarmListenAddr:  defaultSwarmListenAddr,
+		SwarmPort:        DefaultSwarmPort,
+		log:              nopLog{},
+		containerdSocket: defaultContainerdSocket,
 	}
 
 	for _, op := range ops {
 		op(d)
 	}
+
+	return d, nil
+}
+
+// New returns a Daemon instance to be used for testing.
+// This will create a directory such as d123456789 in the folder specified by
+// $DOCKER_INTEGRATION_DAEMON_DEST or $DEST.
+// The daemon will not automatically start.
+func New(t testing.TB, ops ...Option) *Daemon {
+	t.Helper()
+	dest := os.Getenv("DOCKER_INTEGRATION_DAEMON_DEST")
+	if dest == "" {
+		dest = os.Getenv("DEST")
+	}
+	dest = filepath.Join(dest, t.Name())
+
+	assert.Check(t, dest != "", "Please set the DOCKER_INTEGRATION_DAEMON_DEST or the DEST environment variable")
+
+	d, err := NewDaemon(dest, ops...)
+	assert.NilError(t, err, "could not create daemon at %q", dest)
 
 	return d
 }
@@ -190,39 +197,38 @@ func (d *Daemon) ReadLogFile() ([]byte, error) {
 }
 
 // NewClientT creates new client based on daemon's socket path
-func (d *Daemon) NewClientT(t assert.TestingT, extraOpts ...client.Opt) *client.Client {
-	if ht, ok := t.(testutil.HelperT); ok {
-		ht.Helper()
-	}
+func (d *Daemon) NewClientT(t testing.TB, extraOpts ...client.Opt) *client.Client {
+	t.Helper()
 
+	c, err := d.NewClient(extraOpts...)
+	assert.NilError(t, err, "[%s] could not create daemon client", d.id)
+	return c
+}
+
+// NewClient creates new client based on daemon's socket path
+func (d *Daemon) NewClient(extraOpts ...client.Opt) (*client.Client, error) {
 	clientOpts := []client.Opt{
 		client.FromEnv,
 		client.WithHost(d.Sock()),
 	}
 	clientOpts = append(clientOpts, extraOpts...)
 
-	c, err := client.NewClientWithOpts(clientOpts...)
-	assert.NilError(t, err, "cannot create daemon client")
-	return c
+	return client.NewClientWithOpts(clientOpts...)
 }
 
 // Cleanup cleans the daemon files : exec root (network namespaces, ...), swarmkit files
-func (d *Daemon) Cleanup(t testingT) {
-	if ht, ok := t.(testutil.HelperT); ok {
-		ht.Helper()
-	}
-	// Cleanup swarmkit wal files if present
-	cleanupRaftDir(t, d.Root)
-	cleanupNetworkNamespace(t, d.execRoot)
+func (d *Daemon) Cleanup(t testing.TB) {
+	t.Helper()
+	cleanupMount(t, d)
+	cleanupRaftDir(t, d)
+	cleanupNetworkNamespace(t, d)
 }
 
 // Start starts the daemon and return once it is ready to receive requests.
-func (d *Daemon) Start(t testingT, args ...string) {
-	if ht, ok := t.(testutil.HelperT); ok {
-		ht.Helper()
-	}
+func (d *Daemon) Start(t testing.TB, args ...string) {
+	t.Helper()
 	if err := d.StartWithError(args...); err != nil {
-		t.Fatalf("failed to start daemon with arguments %v : %v", args, err)
+		t.Fatalf("[%s] failed to start daemon with arguments %v : %v", d.id, d.args, err)
 	}
 }
 
@@ -231,7 +237,7 @@ func (d *Daemon) Start(t testingT, args ...string) {
 func (d *Daemon) StartWithError(args ...string) error {
 	logFile, err := os.OpenFile(filepath.Join(d.Folder, "docker.log"), os.O_RDWR|os.O_CREATE|os.O_APPEND, 0600)
 	if err != nil {
-		return errors.Wrapf(err, "[%s] Could not create %s/docker.log", d.id, d.Folder)
+		return errors.Wrapf(err, "[%s] failed to create logfile", d.id)
 	}
 
 	return d.StartWithLogFile(logFile, args...)
@@ -245,29 +251,36 @@ func (d *Daemon) StartWithLogFile(out *os.File, providedArgs ...string) error {
 		return errors.Wrapf(err, "[%s] could not find docker binary in $PATH", d.id)
 	}
 
-	args := append(d.GlobalFlags,
-		"--containerd", containerdSocket,
+	if d.pidFile == "" {
+		d.pidFile = filepath.Join(d.Folder, "docker.pid")
+	}
+
+	d.args = []string{
 		"--data-root", d.Root,
 		"--exec-root", d.execRoot,
-		"--pidfile", fmt.Sprintf("%s/docker.pid", d.Folder),
+		"--pidfile", d.pidFile,
 		fmt.Sprintf("--userland-proxy=%t", d.userlandProxy),
 		"--containerd-namespace", d.id,
-		"--containerd-plugins-namespace", d.id+"p",
-	)
+		"--containerd-plugins-namespace", d.id + "p",
+	}
+	if d.containerdSocket != "" {
+		d.args = append(d.args, "--containerd", d.containerdSocket)
+	}
+
 	if d.defaultCgroupNamespaceMode != "" {
-		args = append(args, []string{"--default-cgroupns-mode", d.defaultCgroupNamespaceMode}...)
+		d.args = append(d.args, "--default-cgroupns-mode", d.defaultCgroupNamespaceMode)
 	}
 	if d.experimental {
-		args = append(args, "--experimental")
+		d.args = append(d.args, "--experimental")
 	}
 	if d.init {
-		args = append(args, "--init")
+		d.args = append(d.args, "--init")
 	}
 	if !(d.UseDefaultHost || d.UseDefaultTLSHost) {
-		args = append(args, []string{"--host", d.Sock()}...)
+		d.args = append(d.args, "--host", d.Sock())
 	}
 	if root := os.Getenv("DOCKER_REMAP_ROOT"); root != "" {
-		args = append(args, []string{"--userns-remap", root}...)
+		d.args = append(d.args, "--userns-remap", root)
 	}
 
 	// If we don't explicitly set the log-level or debug flag(-D) then
@@ -283,21 +296,21 @@ func (d *Daemon) StartWithLogFile(out *os.File, providedArgs ...string) error {
 		}
 	}
 	if !foundLog {
-		args = append(args, "--debug")
+		d.args = append(d.args, "--debug")
 	}
 	if d.storageDriver != "" && !foundSd {
-		args = append(args, "--storage-driver", d.storageDriver)
+		d.args = append(d.args, "--storage-driver", d.storageDriver)
 	}
 
-	args = append(args, providedArgs...)
-	d.cmd = exec.Command(dockerdBinary, args...)
+	d.args = append(d.args, providedArgs...)
+	d.cmd = exec.Command(dockerdBinary, d.args...)
 	d.cmd.Env = append(os.Environ(), "DOCKER_SERVICE_PREFER_OFFLINE_IMAGE=1")
 	d.cmd.Stdout = out
 	d.cmd.Stderr = out
 	d.logFile = out
 
 	if err := d.cmd.Start(); err != nil {
-		return errors.Errorf("[%s] could not start daemon container: %v", d.id, err)
+		return errors.Wrapf(err, "[%s] could not start daemon container", d.id)
 	}
 
 	wait := make(chan error, 1)
@@ -321,7 +334,7 @@ func (d *Daemon) StartWithLogFile(out *os.File, providedArgs ...string) error {
 		Transport: clientConfig.transport,
 	}
 
-	req, err := http.NewRequest("GET", "/_ping", nil)
+	req, err := http.NewRequest(http.MethodGet, "/_ping", nil)
 	if err != nil {
 		return errors.Wrapf(err, "[%s] could not create new request", d.id)
 	}
@@ -337,9 +350,9 @@ func (d *Daemon) StartWithLogFile(out *os.File, providedArgs ...string) error {
 
 		select {
 		case <-ctx.Done():
-			return errors.Errorf("[%s] Daemon exited and never started: %s", d.id, ctx.Err())
+			return errors.Wrapf(ctx.Err(), "[%s] daemon exited and never started", d.id)
 		case err := <-d.Wait:
-			return errors.Errorf("[%s] Daemon exited during startup: %v", d.id, err)
+			return errors.Wrapf(err, "[%s] daemon exited during startup", d.id)
 		default:
 			rctx, rcancel := context.WithTimeout(context.TODO(), 2*time.Second)
 			defer rcancel()
@@ -364,7 +377,7 @@ func (d *Daemon) StartWithLogFile(out *os.File, providedArgs ...string) error {
 			d.log.Logf("[%s] daemon started\n", d.id)
 			d.Root, err = d.queryRootDir()
 			if err != nil {
-				return errors.Errorf("[%s] error querying daemon for root directory: %v", d.id, err)
+				return errors.Wrapf(err, "[%s] error querying daemon for root directory", d.id)
 			}
 			return nil
 		}
@@ -373,10 +386,8 @@ func (d *Daemon) StartWithLogFile(out *os.File, providedArgs ...string) error {
 
 // StartWithBusybox will first start the daemon with Daemon.Start()
 // then save the busybox image from the main daemon and load it into this Daemon instance.
-func (d *Daemon) StartWithBusybox(t testingT, arg ...string) {
-	if ht, ok := t.(testutil.HelperT); ok {
-		ht.Helper()
-	}
+func (d *Daemon) StartWithBusybox(t testing.TB, arg ...string) {
+	t.Helper()
 	d.Start(t, arg...)
 	d.LoadBusybox(t)
 }
@@ -396,7 +407,10 @@ func (d *Daemon) Kill() error {
 		return err
 	}
 
-	return os.Remove(fmt.Sprintf("%s/docker.pid", d.Folder))
+	if d.pidFile != "" {
+		_ = os.Remove(d.pidFile)
+	}
+	return nil
 }
 
 // Pid returns the pid of the daemon
@@ -432,16 +446,14 @@ func (d *Daemon) DumpStackAndQuit() {
 // Stop will not delete the daemon directory. If a purged daemon is needed,
 // instantiate a new one with NewDaemon.
 // If an error occurs while starting the daemon, the test will fail.
-func (d *Daemon) Stop(t testingT) {
-	if ht, ok := t.(testutil.HelperT); ok {
-		ht.Helper()
-	}
+func (d *Daemon) Stop(t testing.TB) {
+	t.Helper()
 	err := d.StopWithError()
 	if err != nil {
 		if err != errDaemonNotStarted {
-			t.Fatalf("Error while stopping the daemon %s : %v", d.id, err)
+			t.Fatalf("[%s] error while stopping the daemon: %v", d.id, err)
 		} else {
-			t.Logf("Daemon %s is not started", d.id)
+			t.Logf("[%s] daemon is not started", d.id)
 		}
 	}
 }
@@ -455,12 +467,17 @@ func (d *Daemon) StopWithError() (err error) {
 		return errDaemonNotStarted
 	}
 	defer func() {
-		if err == nil {
-			d.log.Logf("[%s] Daemon stopped", d.id)
+		if err != nil {
+			d.log.Logf("[%s] error while stopping daemon: %v", d.id, err)
 		} else {
-			d.log.Logf("[%s] Error when stopping daemon: %v", d.id, err)
+			d.log.Logf("[%s] daemon stopped", d.id)
+			if d.pidFile != "" {
+				_ = os.Remove(d.pidFile)
+			}
 		}
-		d.logFile.Close()
+		if err := d.logFile.Close(); err != nil {
+			d.log.Logf("[%s] failed to close daemon logfile: %v", d.id, err)
+		}
 		d.cmd = nil
 	}()
 
@@ -469,13 +486,13 @@ func (d *Daemon) StopWithError() (err error) {
 	defer ticker.Stop()
 	tick := ticker.C
 
-	d.log.Logf("[%s] Stopping daemon", d.id)
+	d.log.Logf("[%s] stopping daemon", d.id)
 
 	if err := d.cmd.Process.Signal(os.Interrupt); err != nil {
 		if strings.Contains(err.Error(), "os: process already finished") {
 			return errDaemonNotStarted
 		}
-		return errors.Errorf("could not send signal: %v", err)
+		return errors.Wrapf(err, "[%s] could not send signal", d.id)
 	}
 
 out1:
@@ -485,7 +502,7 @@ out1:
 			return err
 		case <-time.After(20 * time.Second):
 			// time for stopping jobs and run onShutdown hooks
-			d.log.Logf("[%s] daemon stop timeout", d.id)
+			d.log.Logf("[%s] daemon stop timed out after 20 seconds", d.id)
 			break out1
 		}
 	}
@@ -498,32 +515,28 @@ out2:
 		case <-tick:
 			i++
 			if i > 5 {
-				d.log.Logf("tried to interrupt daemon for %d times, now try to kill it", i)
+				d.log.Logf("[%s] tried to interrupt daemon for %d times, now try to kill it", d.id, i)
 				break out2
 			}
-			d.log.Logf("Attempt #%d: daemon is still running with pid %d", i, d.cmd.Process.Pid)
+			d.log.Logf("[%d] attempt #%d/5: daemon is still running with pid %d", i, d.cmd.Process.Pid)
 			if err := d.cmd.Process.Signal(os.Interrupt); err != nil {
-				return errors.Errorf("could not send signal: %v", err)
+				return errors.Wrapf(err, "[%s] attempt #%d/5 could not send signal", d.id, i)
 			}
 		}
 	}
 
 	if err := d.cmd.Process.Kill(); err != nil {
-		d.log.Logf("Could not kill daemon: %v", err)
+		d.log.Logf("[%s] failed to kill daemon: %v", d.id, err)
 		return err
 	}
 
-	d.cmd.Wait()
-
-	return os.Remove(fmt.Sprintf("%s/docker.pid", d.Folder))
+	return nil
 }
 
 // Restart will restart the daemon by first stopping it and the starting it.
 // If an error occurs while starting the daemon, the test will fail.
-func (d *Daemon) Restart(t testingT, args ...string) {
-	if ht, ok := t.(testutil.HelperT); ok {
-		ht.Helper()
-	}
+func (d *Daemon) Restart(t testing.TB, args ...string) {
+	t.Helper()
 	d.Stop(t)
 	d.Start(t, args...)
 }
@@ -582,38 +595,36 @@ func (d *Daemon) ReloadConfig() error {
 
 	<-started
 	if err := signalDaemonReload(d.cmd.Process.Pid); err != nil {
-		return errors.Errorf("error signaling daemon reload: %v", err)
+		return errors.Wrapf(err, "[%s] error signaling daemon reload", d.id)
 	}
 	select {
 	case err := <-errCh:
 		if err != nil {
-			return errors.Errorf("error waiting for daemon reload event: %v", err)
+			return errors.Wrapf(err, "[%s] error waiting for daemon reload event", d.id)
 		}
 	case <-time.After(30 * time.Second):
-		return errors.New("timeout waiting for daemon reload event")
+		return errors.Errorf("[%s] daemon reload event timed out after 30 seconds", d.id)
 	}
 	return nil
 }
 
 // LoadBusybox image into the daemon
-func (d *Daemon) LoadBusybox(t assert.TestingT) {
-	if ht, ok := t.(testutil.HelperT); ok {
-		ht.Helper()
-	}
+func (d *Daemon) LoadBusybox(t testing.TB) {
+	t.Helper()
 	clientHost, err := client.NewClientWithOpts(client.FromEnv)
-	assert.NilError(t, err, "failed to create client")
+	assert.NilError(t, err, "[%s] failed to create client", d.id)
 	defer clientHost.Close()
 
 	ctx := context.Background()
 	reader, err := clientHost.ImageSave(ctx, []string{"busybox:latest"})
-	assert.NilError(t, err, "failed to download busybox")
+	assert.NilError(t, err, "[%s] failed to download busybox", d.id)
 	defer reader.Close()
 
 	c := d.NewClientT(t)
 	defer c.Close()
 
 	resp, err := c.ImageLoad(ctx, reader, true)
-	assert.NilError(t, err, "failed to load busybox")
+	assert.NilError(t, err, "[%s] failed to load busybox", d.id)
 	defer resp.Body.Close()
 }
 
@@ -678,7 +689,7 @@ func (d *Daemon) queryRootDir() (string, error) {
 		Transport: clientConfig.transport,
 	}
 
-	req, err := http.NewRequest("GET", "/info", nil)
+	req, err := http.NewRequest(http.MethodGet, "/info", nil)
 	if err != nil {
 		return "", err
 	}
@@ -710,29 +721,31 @@ func (d *Daemon) queryRootDir() (string, error) {
 }
 
 // Info returns the info struct for this daemon
-func (d *Daemon) Info(t assert.TestingT) types.Info {
-	if ht, ok := t.(testutil.HelperT); ok {
-		ht.Helper()
-	}
+func (d *Daemon) Info(t testing.TB) types.Info {
+	t.Helper()
 	c := d.NewClientT(t)
 	info, err := c.Info(context.Background())
 	assert.NilError(t, err)
+	assert.NilError(t, c.Close())
 	return info
 }
 
-func cleanupRaftDir(t testingT, rootPath string) {
-	if ht, ok := t.(testutil.HelperT); ok {
-		ht.Helper()
-	}
-	for _, p := range []string{"wal", "wal-v3-encrypted", "snap-v3-encrypted"} {
-		dir := filepath.Join(rootPath, "swarm/raft", p)
-		if err := os.RemoveAll(dir); err != nil {
-			t.Logf("error removing %v: %v", dir, err)
-		}
+// cleanupMount unmounts the daemon root directory, or logs a message if
+// unmounting failed.
+func cleanupMount(t testing.TB, d *Daemon) {
+	t.Helper()
+	if err := mount.Unmount(d.Root); err != nil {
+		d.log.Logf("[%s] unable to unmount daemon root (%s): %v", d.id, d.Root, err)
 	}
 }
 
-// ImageService returns the Daemon's ImageService
-func (d *Daemon) ImageService() *images.ImageService {
-	return d.imageService
+// cleanupRaftDir removes swarmkit wal files if present
+func cleanupRaftDir(t testing.TB, d *Daemon) {
+	t.Helper()
+	for _, p := range []string{"wal", "wal-v3-encrypted", "snap-v3-encrypted"} {
+		dir := filepath.Join(d.Root, "swarm/raft", p)
+		if err := os.RemoveAll(dir); err != nil {
+			t.Logf("[%s] error removing %v: %v", d.id, dir, err)
+		}
+	}
 }
