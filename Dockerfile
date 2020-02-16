@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.1.3-experimental
 
 ARG CROSS="false"
-ARG GO_VERSION=1.13.5
+ARG GO_VERSION=1.13.7
 ARG DEBIAN_FRONTEND=noninteractive
 ARG VPNKIT_DIGEST=e508a17cfacc8fd39261d5b4e397df2b953690da577e2c987a47630cd0c42f8e
 ARG DOCKER_BUILDTAGS="apparmor seccomp selinux"
@@ -37,42 +37,44 @@ RUN mkdir -p /usr/src/criu \
     && make PREFIX=/build/ install-criu
 
 FROM base AS registry
-# Install two versions of the registry. The first is an older version that
-# only supports schema1 manifests. The second is a newer version that supports
-# both. This allows integration-cli tests to cover push/pull with both schema1
-# and schema2 manifests.
+WORKDIR /go/src/github.com/docker/distribution
+# Install two versions of the registry. The first one is a recent version that
+# supports both schema 1 and 2 manifests. The second one is an older version that
+# only supports schema1 manifests. This allows integration-cli tests to cover
+# push/pull with both schema1 and schema2 manifests.
+# The old version of the registry is not working on arm64, so installation is
+# skipped on that architecture.
 ENV REGISTRY_COMMIT_SCHEMA1 ec87e9b6971d831f0eff752ddb54fb64693e51cd
 ENV REGISTRY_COMMIT 47a064d4195a9b56133891bbb13620c3ac83a827
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=tmpfs,target=/go/src/ \
         set -x \
-        && export GOPATH="$(mktemp -d)" \
-        && git clone https://github.com/docker/distribution.git "$GOPATH/src/github.com/docker/distribution" \
-        && (cd "$GOPATH/src/github.com/docker/distribution" && git checkout -q "$REGISTRY_COMMIT") \
-        && GOPATH="$GOPATH/src/github.com/docker/distribution/Godeps/_workspace:$GOPATH" \
+        && git clone https://github.com/docker/distribution.git . \
+        && git checkout -q "$REGISTRY_COMMIT" \
+        && GOPATH="/go/src/github.com/docker/distribution/Godeps/_workspace:$GOPATH" \
            go build -buildmode=pie -o /build/registry-v2 github.com/docker/distribution/cmd/registry \
         && case $(dpkg --print-architecture) in \
-               amd64|ppc64*|s390x) \
-               (cd "$GOPATH/src/github.com/docker/distribution" && git checkout -q "$REGISTRY_COMMIT_SCHEMA1"); \
-               GOPATH="$GOPATH/src/github.com/docker/distribution/Godeps/_workspace:$GOPATH"; \
+               amd64|armhf|ppc64*|s390x) \
+               git checkout -q "$REGISTRY_COMMIT_SCHEMA1"; \
+               GOPATH="/go/src/github.com/docker/distribution/Godeps/_workspace:$GOPATH"; \
                    go build -buildmode=pie -o /build/registry-v2-schema1 github.com/docker/distribution/cmd/registry; \
                 ;; \
-           esac \
-        && rm -rf "$GOPATH"
+           esac
 
 FROM base AS swagger
+WORKDIR $GOPATH/src/github.com/go-swagger/go-swagger
 # Install go-swagger for validating swagger.yaml
 # This is https://github.com/kolyshkin/go-swagger/tree/golang-1.13-fix
 # TODO: move to under moby/ or fix upstream go-swagger to work for us.
-ENV GO_SWAGGER_COMMIT 5793aa66d4b4112c2602c716516e24710e4adbb5
+ENV GO_SWAGGER_COMMIT 5e6cb12f7c82ce78e45ba71fa6cb1928094db050
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=tmpfs,target=/go/src/ \
         set -x \
-        && export GOPATH="$(mktemp -d)" \
-        && git clone https://github.com/kolyshkin/go-swagger.git "$GOPATH/src/github.com/go-swagger/go-swagger" \
-        && (cd "$GOPATH/src/github.com/go-swagger/go-swagger" && git checkout -q "$GO_SWAGGER_COMMIT") \
-        && go build -o /build/swagger github.com/go-swagger/go-swagger/cmd/swagger \
-        && rm -rf "$GOPATH"
+        && git clone https://github.com/kolyshkin/go-swagger.git . \
+        && git checkout -q "$GO_SWAGGER_COMMIT" \
+        && go build -o /build/swagger github.com/go-swagger/go-swagger/cmd/swagger
 
 FROM base AS frozen-images
 ARG DEBIAN_FRONTEND
@@ -336,6 +338,7 @@ COPY --from=runc        /build/ /usr/local/bin/
 COPY --from=containerd  /build/ /usr/local/bin/
 COPY --from=rootlesskit /build/ /usr/local/bin/
 COPY --from=proxy       /build/ /usr/local/bin/
+COPY --from=vpnkit      /vpnkit /usr/local/bin/vpnkit.x86_64
 WORKDIR /go/src/github.com/docker/docker
 
 FROM binary-base AS build-binary
@@ -352,6 +355,7 @@ FROM binary-base AS build-cross
 ARG DOCKER_CROSSPLATFORMS
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=bind,target=/go/src/github.com/docker/docker \
+    --mount=type=tmpfs,target=/go/src/github.com/docker/docker/autogen \
         hack/make.sh cross
 
 FROM scratch AS binary
