@@ -394,7 +394,7 @@ func (s *DockerSuite) TestContainerAPIPause(c *testing.T) {
 
 func (s *DockerSuite) TestContainerAPITop(c *testing.T) {
 	testRequires(c, DaemonIsLinux)
-	out, _ := dockerCmd(c, "run", "-d", "busybox", "/bin/sh", "-c", "top")
+	out, _ := dockerCmd(c, "run", "-d", "busybox", "/bin/sh", "-c", "top && true")
 	id := strings.TrimSpace(out)
 	assert.NilError(c, waitRun(id))
 
@@ -411,7 +411,7 @@ func (s *DockerSuite) TestContainerAPITop(c *testing.T) {
 		c.Fatalf("expected `USER` at `Titles[0]` and `COMMAND` at Titles[10]: %v", top.Titles)
 	}
 	assert.Equal(c, len(top.Processes), 2, fmt.Sprintf("expected 2 processes, found %d: %v", len(top.Processes), top.Processes))
-	assert.Equal(c, top.Processes[0][10], "/bin/sh -c top")
+	assert.Equal(c, top.Processes[0][10], "/bin/sh -c top && true")
 	assert.Equal(c, top.Processes[1][10], "top")
 }
 
@@ -871,7 +871,7 @@ func (s *DockerSuite) TestCreateWithTooLowMemoryLimit(c *testing.T) {
 	} else {
 		assert.Assert(c, res.StatusCode != http.StatusOK)
 	}
-	assert.Assert(c, strings.Contains(string(b), "Minimum memory limit allowed is 4MB"))
+	assert.Assert(c, strings.Contains(string(b), "Minimum memory limit allowed is 6MB"))
 }
 
 func (s *DockerSuite) TestContainerAPIRename(c *testing.T) {

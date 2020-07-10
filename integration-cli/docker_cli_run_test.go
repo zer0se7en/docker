@@ -2826,13 +2826,11 @@ func (s *DockerSuite) TestRunPIDHostWithChildIsKillable(c *testing.T) {
 }
 
 func (s *DockerSuite) TestRunWithTooSmallMemoryLimit(c *testing.T) {
-	// TODO Windows. This may be possible to enable once Windows supports
-	// memory limits on containers
+	// TODO Windows. This may be possible to enable once Windows supports memory limits on containers
 	testRequires(c, DaemonIsLinux)
-	// this memory limit is 1 byte less than the min, which is 4MB
-	// https://github.com/docker/docker/blob/v1.5.0/daemon/create.go#L22
-	out, _, err := dockerCmdWithError("run", "-m", "4194303", "busybox")
-	if err == nil || !strings.Contains(out, "Minimum memory limit allowed is 4MB") {
+	// this memory limit is 1 byte less than the min (daemon.linuxMinMemory), which is 6MB (6291456 bytes)
+	out, _, err := dockerCmdWithError("create", "-m", "6291455", "busybox")
+	if err == nil || !strings.Contains(out, "Minimum memory limit allowed is 6MB") {
 		c.Fatalf("expected run to fail when using too low a memory limit: %q", out)
 	}
 }
@@ -2930,7 +2928,7 @@ func (s *DockerSuite) TestRunUnshareProc(c *testing.T) {
 
 	go func() {
 		name := "acidburn"
-		out, _, err := dockerCmdWithError("run", "--name", name, "--security-opt", "seccomp=unconfined", "debian:jessie", "unshare", "-p", "-m", "-f", "-r", "--mount-proc=/proc", "mount")
+		out, _, err := dockerCmdWithError("run", "--name", name, "--security-opt", "seccomp=unconfined", "debian:buster", "unshare", "-p", "-m", "-f", "-r", "--mount-proc=/proc", "mount")
 		if err == nil ||
 			!(strings.Contains(strings.ToLower(out), "permission denied") ||
 				strings.Contains(strings.ToLower(out), "operation not permitted")) {
@@ -2942,7 +2940,7 @@ func (s *DockerSuite) TestRunUnshareProc(c *testing.T) {
 
 	go func() {
 		name := "cereal"
-		out, _, err := dockerCmdWithError("run", "--name", name, "--security-opt", "seccomp=unconfined", "debian:jessie", "unshare", "-p", "-m", "-f", "-r", "mount", "-t", "proc", "none", "/proc")
+		out, _, err := dockerCmdWithError("run", "--name", name, "--security-opt", "seccomp=unconfined", "debian:buster", "unshare", "-p", "-m", "-f", "-r", "mount", "-t", "proc", "none", "/proc")
 		if err == nil ||
 			!(strings.Contains(strings.ToLower(out), "mount: cannot mount none") ||
 				strings.Contains(strings.ToLower(out), "permission denied") ||
@@ -2956,7 +2954,7 @@ func (s *DockerSuite) TestRunUnshareProc(c *testing.T) {
 	/* Ensure still fails if running privileged with the default policy */
 	go func() {
 		name := "crashoverride"
-		out, _, err := dockerCmdWithError("run", "--privileged", "--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=docker-default", "--name", name, "debian:jessie", "unshare", "-p", "-m", "-f", "-r", "mount", "-t", "proc", "none", "/proc")
+		out, _, err := dockerCmdWithError("run", "--privileged", "--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=docker-default", "--name", name, "debian:buster", "unshare", "-p", "-m", "-f", "-r", "mount", "-t", "proc", "none", "/proc")
 		if err == nil ||
 			!(strings.Contains(strings.ToLower(out), "mount: cannot mount none") ||
 				strings.Contains(strings.ToLower(out), "permission denied") ||
