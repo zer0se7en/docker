@@ -30,8 +30,8 @@ func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) 
 	v.KernelMemory = sysInfo.KernelMemory
 	v.KernelMemoryTCP = sysInfo.KernelMemoryTCP
 	v.OomKillDisable = sysInfo.OomKillDisable
-	v.CPUCfsPeriod = sysInfo.CPUCfsPeriod
-	v.CPUCfsQuota = sysInfo.CPUCfsQuota
+	v.CPUCfsPeriod = sysInfo.CPUCfs
+	v.CPUCfsQuota = sysInfo.CPUCfs
 	v.CPUShares = sysInfo.CPUShares
 	v.CPUSet = sysInfo.Cpuset
 	v.PidsLimit = sysInfo.PidsLimit
@@ -99,9 +99,6 @@ func (daemon *Daemon) fillPlatformInfo(v *types.Info, sysInfo *sysinfo.SysInfo) 
 		}
 		if !v.SwapLimit {
 			v.Warnings = append(v.Warnings, "WARNING: No swap limit support")
-		}
-		if !v.KernelMemory {
-			v.Warnings = append(v.Warnings, "WARNING: No kernel memory limit support")
 		}
 		if !v.KernelMemoryTCP {
 			v.Warnings = append(v.Warnings, "WARNING: No kernel memory TCP limit support")

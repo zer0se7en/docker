@@ -162,7 +162,6 @@ func WithCapabilities(c *container.Container) coci.SpecOpts {
 			caps.DefaultCapabilities(),
 			c.HostConfig.CapAdd,
 			c.HostConfig.CapDrop,
-			c.HostConfig.Capabilities,
 			c.HostConfig.Privileged,
 		)
 		if err != nil {
@@ -177,7 +176,14 @@ func readUserFile(c *container.Container, p string) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	return os.Open(fp)
+	fh, err := os.Open(fp)
+	if err != nil {
+		// This is needed because a nil *os.File is different to a nil
+		// io.ReadCloser and this causes GetExecUser to not detect that the
+		// container file is missing.
+		return nil, err
+	}
+	return fh, nil
 }
 
 func getUser(c *container.Container, username string) (uint32, uint32, []uint32, error) {
@@ -824,15 +830,32 @@ func WithCgroups(daemon *Daemon, c *container.Container) coci.SpecOpts {
 			cgroupsPath = filepath.Join(parent, c.ID)
 		}
 		s.Linux.CgroupsPath = cgroupsPath
+
+		// the rest is only needed for CPU RT controller
+
+		if daemon.configStore.CPURealtimePeriod == 0 && daemon.configStore.CPURealtimeRuntime == 0 {
+			return nil
+		}
+
+		if cgroups.IsCgroup2UnifiedMode() {
+			return errors.New("daemon-scoped cpu-rt-period and cpu-rt-runtime are not implemented for cgroup v2")
+		}
+
+		// FIXME this is very expensive way to check if cpu rt is supported
+		sysInfo := daemon.RawSysInfo(true)
+		if !sysInfo.CPURealtime {
+			return errors.New("daemon-scoped cpu-rt-period and cpu-rt-runtime are not supported by the kernel")
+		}
+
 		p := cgroupsPath
 		if useSystemd {
 			initPath, err := cgroups.GetInitCgroup("cpu")
 			if err != nil {
-				return err
+				return errors.Wrap(err, "unable to init CPU RT controller")
 			}
 			_, err = cgroups.GetOwnCgroup("cpu")
 			if err != nil {
-				return err
+				return errors.Wrap(err, "unable to init CPU RT controller")
 			}
 			p = filepath.Join(initPath, s.Linux.CgroupsPath)
 		}
@@ -843,8 +866,19 @@ func WithCgroups(daemon *Daemon, c *container.Container) coci.SpecOpts {
 			parentPath = filepath.Clean("/" + parentPath)
 		}
 
-		if err := daemon.initCgroupsPath(parentPath); err != nil {
-			return fmt.Errorf("linux init cgroups path: %v", err)
+		mnt, root, err := cgroups.FindCgroupMountpointAndRoot("", "cpu")
+		if err != nil {
+			return errors.Wrap(err, "unable to init CPU RT controller")
+		}
+		// When docker is run inside docker, the root is based of the host cgroup.
+		// Should this be handled in runc/libcontainer/cgroups ?
+		if strings.HasPrefix(root, "/docker/") {
+			root = "/"
+		}
+		mnt = filepath.Join(mnt, root)
+
+		if err := daemon.initCPURtController(mnt, parentPath); err != nil {
+			return errors.Wrap(err, "unable to init CPU RT controller")
 		}
 		return nil
 	}
