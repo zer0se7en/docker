@@ -4345,7 +4345,7 @@ definitions:
         example: 4
       MemTotal:
         description: |
-          Total amount of physical memory available on the host, in kilobytes (kB).
+          Total amount of physical memory available on the host, in bytes.
         type: "integer"
         format: "int64"
         example: 2095882240
@@ -6617,7 +6617,7 @@ paths:
           type: "string"
         - name: "v"
           in: "query"
-          description: "Remove the volumes associated with the container."
+          description: "Remove anonymous volumes associated with the container."
           type: "boolean"
           default: false
         - name: "force"
@@ -7712,7 +7712,7 @@ paths:
             API-Version:
               type: "string"
               description: "Max API Version the server supports"
-            BuildKit-Version:
+            Builder-Version:
               type: "string"
               description: "Default version of docker image builder"
             Docker-Experimental:

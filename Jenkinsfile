@@ -214,14 +214,6 @@ pipeline {
                                 '''
                             }
                         }
-                        stage("Build e2e image") {
-                            steps {
-                                sh '''
-                                echo "Building e2e image"
-                                docker build --build-arg DOCKER_GITCOMMIT=${GIT_COMMIT} -t moby-e2e-test -f Dockerfile.e2e .
-                                '''
-                            }
-                        }
                     }
 
                     post {
@@ -1014,11 +1006,12 @@ pipeline {
                             junit testResults: 'bundles/junit-report-*.xml', allowEmptyResults: true
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', message: 'Failed to create bundles.tar.gz') {
                                 powershell '''
+                                cd $env:WORKSPACE
                                 $bundleName="windowsRS1-integration"
                                 Write-Host -ForegroundColor Green "Creating ${bundleName}-bundles.zip"
 
                                 # archiveArtifacts does not support env-vars to , so save the artifacts in a fixed location
-                                Compress-Archive -Path "${env:TEMP}/CIDUT.out", "${env:TEMP}/CIDUT.err", "${env:TEMP}/testresults/unittests/junit-report-unit-tests.xml" -CompressionLevel Optimal -DestinationPath "${bundleName}-bundles.zip"
+                                Compress-Archive -Path "bundles/CIDUT.out", "bundles/CIDUT.err", "bundles/junit-report-*.xml" -CompressionLevel Optimal -DestinationPath "${bundleName}-bundles.zip"
                                 '''
 
                                 archiveArtifacts artifacts: '*-bundles.zip', allowEmptyArchive: true
@@ -1075,11 +1068,12 @@ pipeline {
                             junit testResults: 'bundles/junit-report-*.xml', allowEmptyResults: true
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', message: 'Failed to create bundles.tar.gz') {
                                 powershell '''
+                                cd $env:WORKSPACE
                                 $bundleName="windowsRS5-integration"
                                 Write-Host -ForegroundColor Green "Creating ${bundleName}-bundles.zip"
 
                                 # archiveArtifacts does not support env-vars to , so save the artifacts in a fixed location
-                                Compress-Archive -Path "${env:TEMP}/CIDUT.out", "${env:TEMP}/CIDUT.err", "${env:TEMP}/junit-report-*.xml" -CompressionLevel Optimal -DestinationPath "${bundleName}-bundles.zip"
+                                Compress-Archive -Path "bundles/CIDUT.out", "bundles/CIDUT.err", "bundles/junit-report-*.xml" -CompressionLevel Optimal -DestinationPath "${bundleName}-bundles.zip"
                                 '''
 
                                 archiveArtifacts artifacts: '*-bundles.zip', allowEmptyArchive: true
