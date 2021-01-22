@@ -45,6 +45,7 @@ import (
 	lntypes "github.com/docker/libnetwork/types"
 	"github.com/moby/sys/mount"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -460,7 +461,7 @@ func verifyPlatformContainerResources(resources *containertypes.Resources, sysIn
 		resources.MemoryReservation = 0
 	}
 	if resources.MemoryReservation > 0 && resources.MemoryReservation < linuxMinMemory {
-		return warnings, fmt.Errorf("Minimum memory reservation allowed is 4MB")
+		return warnings, fmt.Errorf("Minimum memory reservation allowed is 6MB")
 	}
 	if resources.Memory > 0 && resources.MemoryReservation > 0 && resources.Memory < resources.MemoryReservation {
 		return warnings, fmt.Errorf("Minimum memory limit can not be less than memory reservation limit, see usage")
@@ -822,7 +823,7 @@ func overlaySupportsSelinux() (bool, error) {
 // configureKernelSecuritySupport configures and validates security support for the kernel
 func configureKernelSecuritySupport(config *config.Config, driverName string) error {
 	if config.EnableSelinuxSupport {
-		if !selinuxEnabled() {
+		if !selinux.GetEnabled() {
 			logrus.Warn("Docker could not enable SELinux on the host system")
 			return nil
 		}
@@ -840,7 +841,7 @@ func configureKernelSecuritySupport(config *config.Config, driverName string) er
 			}
 		}
 	} else {
-		selinuxSetDisabled()
+		selinux.SetDisabled()
 	}
 	return nil
 }
