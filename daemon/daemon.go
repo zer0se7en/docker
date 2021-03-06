@@ -301,15 +301,6 @@ func (daemon *Daemon) restore() error {
 				mapLock.Unlock()
 				return
 			}
-
-			// The LogConfig.Type is empty if the container was created before docker 1.12 with default log driver.
-			// We should rewrite it to use the daemon defaults.
-			// Fixes https://github.com/docker/docker/issues/22536
-			if c.HostConfig.LogConfig.Type == "" {
-				if err := daemon.mergeAndVerifyLogConfig(&c.HostConfig.LogConfig); err != nil {
-					log.WithError(err).Error("failed to verify log config for container")
-				}
-			}
 		}(c)
 	}
 	group.Wait()
@@ -795,7 +786,7 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 	}
 
 	// set up the tmpDir to use a canonical path
-	tmp, err := prepareTempDir(config.Root, rootIDs)
+	tmp, err := prepareTempDir(config.Root)
 	if err != nil {
 		return nil, fmt.Errorf("Unable to get the TempDir under %s: %s", config.Root, err)
 	}
@@ -861,7 +852,7 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 	}
 
 	daemonRepo := filepath.Join(config.Root, "containers")
-	if err := idtools.MkdirAllAndChown(daemonRepo, 0700, rootIDs); err != nil {
+	if err := idtools.MkdirAllAndChown(daemonRepo, 0701, idtools.CurrentIdentity()); err != nil {
 		return nil, err
 	}
 
@@ -1374,7 +1365,7 @@ func (daemon *Daemon) Subnets() ([]net.IPNet, []net.IPNet) {
 // prepareTempDir prepares and returns the default directory to use
 // for temporary files.
 // If it doesn't exist, it is created. If it exists, its content is removed.
-func prepareTempDir(rootDir string, rootIdentity idtools.Identity) (string, error) {
+func prepareTempDir(rootDir string) (string, error) {
 	var tmpDir string
 	if tmpDir = os.Getenv("DOCKER_TMPDIR"); tmpDir == "" {
 		tmpDir = filepath.Join(rootDir, "tmp")
@@ -1392,9 +1383,7 @@ func prepareTempDir(rootDir string, rootIdentity idtools.Identity) (string, erro
 			}
 		}
 	}
-	// We don't remove the content of tmpdir if it's not the default,
-	// it may hold things that do not belong to us.
-	return tmpDir, idtools.MkdirAllAndChown(tmpDir, 0700, rootIdentity)
+	return tmpDir, idtools.MkdirAllAndChown(tmpDir, 0700, idtools.CurrentIdentity())
 }
 
 func (daemon *Daemon) setGenericResources(conf *config.Config) error {

@@ -15,9 +15,15 @@
 # * DOCKERD_ROOTLESS_ROOTLESSKIT_SLIRP4NETNS_SANDBOX=(auto|true|false): whether to protect slirp4netns with a dedicated mount namespace. Defaults to "auto".
 # * DOCKERD_ROOTLESS_ROOTLESSKIT_SLIRP4NETNS_SECCOMP=(auto|true|false): whether to protect slirp4netns with seccomp. Defaults to "auto".
 #
-# See the documentation for the further information: https://docs.docker.com/engine/security/rootless/
+# See the documentation for the further information: https://docs.docker.com/go/rootless/
 
 set -e -x
+case "$1" in
+	"check" | "install" | "uninstall")
+		echo "Did you mean 'dockerd-rootless-setuptool.sh $@' ?"
+		exit 1
+		;;
+esac
 if ! [ -w $XDG_RUNTIME_DIR ]; then
 	echo "XDG_RUNTIME_DIR needs to be set and writable"
 	exit 1
@@ -74,6 +80,10 @@ fi
 if [ -z $_DOCKERD_ROOTLESS_CHILD ]; then
 	_DOCKERD_ROOTLESS_CHILD=1
 	export _DOCKERD_ROOTLESS_CHILD
+	if [ "$(id -u)" = "0" ]; then
+		echo "This script must be executed as a non-privileged user"
+		exit 1
+	fi
 	# Re-exec the script via RootlessKit, so as to create unprivileged {user,mount,network} namespaces.
 	#
 	# --copy-up allows removing/creating files in the directories by creating tmpfs and symlinks
