@@ -226,6 +226,7 @@ echo 'Optional Features:'
 }
 {
 	check_flags SECCOMP
+	check_flags SECCOMP_FILTER
 }
 {
 	check_flags CGROUP_PIDS
@@ -300,6 +301,8 @@ flags=(
 	IP_VS_PROTO_TCP
 	IP_VS_PROTO_UDP
 	IP_VS_RR
+	SECURITY_SELINUX
+	SECURITY_APPARMOR
 )
 check_flags "${flags[@]}"
 
