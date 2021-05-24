@@ -151,12 +151,12 @@ RUN --mount=type=cache,sharing=locked,id=moby-cross-true-aptlib,target=/var/lib/
 
 FROM runtime-dev-cross-${CROSS} AS runtime-dev
 
-FROM base AS tomlv
-ARG TOMLV_COMMIT
+FROM base AS tomll
+ARG GOTOML_VERSION
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=bind,src=hack/dockerfile/install,target=/tmp/install \
-        PREFIX=/build /tmp/install/install.sh tomlv
+    --mount=type=bind,src=hack/dockerfile/install/tomll.installer,target=/tmp/install/tomll.installer \
+        . /tmp/install/tomll.installer && PREFIX=/build install_tomll
 
 FROM base AS vndr
 ARG VNDR_COMMIT
@@ -300,12 +300,12 @@ RUN update-alternatives --set iptables  /usr/sbin/iptables-legacy  || true \
  && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy || true \
  && update-alternatives --set arptables /usr/sbin/arptables-legacy || true
 
-RUN pip3 install yamllint==1.16.0
+RUN pip3 install yamllint==1.26.1
 
 COPY --from=dockercli     /build/ /usr/local/cli
 COPY --from=frozen-images /build/ /docker-frozen-images
 COPY --from=swagger       /build/ /usr/local/bin/
-COPY --from=tomlv         /build/ /usr/local/bin/
+COPY --from=tomll         /build/ /usr/local/bin/
 COPY --from=tini          /build/ /usr/local/bin/
 COPY --from=registry      /build/ /usr/local/bin/
 COPY --from=criu          /build/ /usr/local/
